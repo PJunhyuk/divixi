@@ -1692,18 +1692,34 @@ fn fold(tx: &rusqlite::Transaction<'_>, run: &str) -> anyhow::Result<()> {
          WHERE run_id = ?1 AND kind IN ('message', 'plan', 'tool_call') ORDER BY seq",
     )?;
     let rows = stmt.query_map(params![run], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    // Text an agent writes on either side of a tool call is two passages,
+    // not one: "It's an npm install, not Homebrew." then, after the call,
+    // "`check-claude-app` is gone". Joined as they came they read as one
+    // run-on line once the timeline shows `output`, which it does for every
+    // run it has not replayed.
+    let mut after_tool = false;
     for row in rows {
         let (kind, payload) = row?;
         let value: serde_json::Value = serde_json::from_str(&payload)?;
         match kind.as_str() {
-            "message" => output.push_str(value["text"].as_str().unwrap_or_default()),
+            "message" => {
+                let text = value["text"].as_str().unwrap_or_default();
+                if after_tool && !output.is_empty() && !output.ends_with('\n') && !text.starts_with('\n') {
+                    output.push_str("\n\n");
+                }
+                after_tool = false;
+                output.push_str(text);
+            }
             "plan" => {
                 plan = value["entries"]
                     .as_array()
                     .map(|a| a.iter().filter_map(|e| e.as_str().map(str::to_owned)).collect())
                     .unwrap_or_default();
             }
-            "tool_call" => tools.push(value["title"].as_str().unwrap_or_default().to_owned()),
+            "tool_call" => {
+                after_tool = true;
+                tools.push(value["title"].as_str().unwrap_or_default().to_owned())
+            }
             _ => {}
         }
     }
@@ -2516,6 +2532,22 @@ mod tests {
 
         let snippet = store.search("tokenizer").unwrap().remove(0).snippet;
         assert!(snippet.contains("[tokenizer]"), "{snippet}");
+    }
+
+    /// What a conductor wrote before a tool call and after it are kept apart
+    /// in the stored output; chunks of one passage still join as they came.
+    #[test]
+    fn text_on_either_side_of_a_tool_call_stays_two_passages() {
+        let store = Store::in_memory().unwrap();
+        let run = store.begin_run(TR, "conductor", "claude_code", "clean up", ".").unwrap();
+        store.append(&run, 10, &AgentEvent::Message { text: "It's an npm global ".into() }).unwrap();
+        store.append(&run, 11, &AgentEvent::Message { text: "install, not Homebrew.".into() }).unwrap();
+        store.append(&run, 12, &tool("t1", "npm install -g tokscale@latest")).unwrap();
+        store.append(&run, 13, &AgentEvent::Message { text: "`check-claude-app` is gone.".into() }).unwrap();
+        store.append(&run, 90, &AgentEvent::Finished { stop_reason: "end_turn".into() }).unwrap();
+
+        let output = store.run(&run).unwrap().unwrap().output;
+        assert_eq!(output, "It's an npm global install, not Homebrew.\n\n`check-claude-app` is gone.");
     }
 
     #[test]
