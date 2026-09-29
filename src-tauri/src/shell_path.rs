@@ -132,11 +132,15 @@ fn is_launchd_default(path: &OsStr) -> bool {
 /// the PATH has come: something a startup file starts in the background can
 /// keep the pipe open long after the shell is gone, and waiting for the end
 /// of it would wait for that. The shell is killed if it has not finished by
-/// then, and when `timeout` runs out.
+/// then. When `timeout` runs out, its whole process group goes: whatever
+/// a startup file was stuck in would otherwise be left running, once for
+/// every launch. It has a group of its own for that reason.
 fn read(shell: &Path, env: &[(&str, &str)], timeout: Duration) -> Result<String, String> {
+    use std::os::unix::process::CommandExt;
     let mut cmd = Command::new(shell);
-    cmd.args(["-l", "-i", "-c", &format!("echo {MARKER}; /usr/bin/printenv PATH")])
+    cmd.args(shell_args(shell))
         .envs(env.iter().copied())
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -163,13 +167,30 @@ fn read(shell: &Path, env: &[(&str, &str)], timeout: Duration) -> Result<String,
                     break Ok(path);
                 }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => break Err(format!("{} gave no PATH within {}s", shell.display(), timeout.as_secs())),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // The shell leads its group, so the group's id is its pid.
+                let _ = Command::new("/bin/kill").args(["-KILL", "--", &format!("-{}", child.id())]).stderr(Stdio::null()).status();
+                break Err(format!("{} gave no PATH within {}s", shell.display(), timeout.as_secs()));
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => break Err(format!("{} ended without printing a PATH", shell.display())),
         }
     };
     let _ = child.kill();
     let _ = child.wait();
     found
+}
+
+/// How to ask `shell` for its PATH. csh and tcsh take `-l` only as their
+/// sole option, so they cannot be both a login shell and run a command;
+/// they read `.cshrc` on every start, which is where their users set PATH.
+fn shell_args(shell: &Path) -> Vec<String> {
+    let command = format!("echo {MARKER}; /usr/bin/printenv PATH");
+    let name = shell.file_name().and_then(OsStr::to_str).unwrap_or_default();
+    if matches!(name, "csh" | "tcsh") {
+        vec!["-c".into(), command]
+    } else {
+        vec!["-l".into(), "-i".into(), "-c".into(), command]
+    }
 }
 
 /// The PATH out of a login shell's output: the line after [`MARKER`], if it
@@ -272,11 +293,23 @@ mod tests {
     }
 
     #[test]
-    fn a_shell_that_never_finishes_starting_is_given_up_on() {
-        let home = zdotdir("sleep 10\n");
+    fn a_shell_that_never_finishes_starting_is_given_up_on_with_what_it_started() {
+        // An odd length, so the check below finds this test's sleep and no other.
+        let home = zdotdir("sleep 4613\n");
         let started = Instant::now();
         let err = read(Path::new("/bin/zsh"), &[("ZDOTDIR", home.to_str().unwrap())], Duration::from_millis(500)).unwrap_err();
         assert!(err.contains("gave no PATH"), "{err}");
         assert!(started.elapsed() < Duration::from_secs(3), "took {:?}", started.elapsed());
+        std::thread::sleep(Duration::from_millis(200));
+        let left = Command::new("/usr/bin/pgrep").args(["-f", "sleep 4613"]).output().unwrap();
+        assert!(left.stdout.is_empty(), "the startup file's sleep outlived the shell");
+    }
+
+    #[test]
+    fn tcsh_is_asked_the_way_it_accepts() {
+        let home = zdotdir("");
+        std::fs::write(home.join(".cshrc"), "echo 'Welcome back!'\nsetenv PATH /opt/divixi-test/bin:${PATH}\n").unwrap();
+        let path = read(Path::new("/bin/tcsh"), &[("HOME", home.to_str().unwrap())], Duration::from_secs(20)).unwrap();
+        assert!(path.starts_with("/opt/divixi-test/bin:"), "{path}");
     }
 }
