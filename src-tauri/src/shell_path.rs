@@ -18,9 +18,11 @@
 //! is left alone.
 //!
 //! It changes this process's environment, so [`adopt`] runs at the top of
-//! `run`, before any thread exists. Logging has not started yet, so what it
-//! did waits in [`OUTCOME`] until [`log`] can say.
+//! `run`, before any thread that could read it exists. The one thread it
+//! starts itself reads the shell's output and nothing else. Logging has not
+//! started yet, so what it did waits in [`OUTCOME`] until [`log`] can say.
 
+use std::ffi::{OsStr, OsString};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -40,7 +42,8 @@ const MARKER: &str = "__DIVIXI_LOGIN_PATH__";
 /// shell that is still going after this is stuck, and the window is waiting.
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-/// When `SHELL` is not set: the default login shell since macOS 10.15.
+/// When neither `SHELL` nor the account says: the default login shell since
+/// macOS 10.15.
 const FALLBACK_SHELL: &str = "/bin/zsh";
 
 /// What [`adopt`] did, for the log.
@@ -58,13 +61,13 @@ static OUTCOME: OnceLock<Outcome> = OnceLock::new();
 
 /// Take the login shell's PATH when this process has only launchd's.
 ///
-/// Call once, before any thread exists: it sets `PATH`.
+/// Call once, before any other thread exists: it sets `PATH`.
 pub fn adopt() {
-    let current = std::env::var("PATH").unwrap_or_default();
+    let current = std::env::var_os("PATH").unwrap_or_default();
     let outcome = if !is_launchd_default(&current) {
         Outcome::Kept
     } else {
-        let shell = std::env::var_os("SHELL").filter(|s| !s.is_empty()).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(FALLBACK_SHELL));
+        let shell = login_shell();
         match read(&shell, &[], TIMEOUT) {
             Ok(found) => {
                 let (path, added) = merge(&found, &current);
@@ -82,15 +85,38 @@ pub fn log() {
     match OUTCOME.get() {
         Some(Outcome::Adopted { shell, added }) => tracing::info!(%shell, added, "PATH taken from the login shell"),
         Some(Outcome::Failed { shell, error }) => {
-            tracing::warn!(%shell, %error, "the PATH is launchd's and the login shell's could not be read: agents that run under node will not start")
+            tracing::warn!(%shell, %error, "the PATH is launchd's and the login shell's could not be read: agents that run under node may not start")
         }
         Some(Outcome::Kept) | None => {}
     }
 }
 
+/// The user's login shell: `SHELL`, which launchd sets from the account, or
+/// else the account's own record, or else [`FALLBACK_SHELL`]. Running zsh for
+/// someone whose shell is bash or fish would miss the lines in their files.
+fn login_shell() -> PathBuf {
+    if let Some(shell) = std::env::var_os("SHELL").filter(|s| !s.is_empty()) {
+        return PathBuf::from(shell);
+    }
+    let user = std::env::var("USER").unwrap_or_default();
+    Command::new("/usr/bin/dscl")
+        .args([".", "-read", &format!("/Users/{user}"), "UserShell"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .and_then(|out| account_shell(&String::from_utf8_lossy(&out.stdout)))
+        .unwrap_or_else(|| PathBuf::from(FALLBACK_SHELL))
+}
+
+/// The shell out of `dscl . -read /Users/<name> UserShell`: `UserShell: /bin/bash`.
+fn account_shell(dscl: &str) -> Option<PathBuf> {
+    let shell = dscl.lines().find_map(|l| l.strip_prefix("UserShell:"))?.trim();
+    shell.starts_with('/').then(|| PathBuf::from(shell))
+}
+
 /// Whether `path` is launchd's: nothing in it but [`LAUNCHD_DIRS`]. An empty
 /// PATH counts, since it has even less.
-fn is_launchd_default(path: &str) -> bool {
+fn is_launchd_default(path: &OsStr) -> bool {
     std::env::split_paths(path).all(|dir| dir.as_os_str().is_empty() || LAUNCHD_DIRS.iter().any(|d| dir == Path::new(d)))
 }
 
@@ -157,8 +183,9 @@ fn parse(lines: &[String]) -> Option<String> {
 }
 
 /// The login shell's directories first, then this process's that it did not
-/// have, each once. Also how many are new to this process.
-fn merge(shell: &str, current: &str) -> (String, usize) {
+/// have, each once. Also how many are new to this process. `current` stays
+/// an `OsStr`, so a directory in it that is not UTF-8 is kept, not dropped.
+fn merge(shell: &str, current: &OsStr) -> (OsString, usize) {
     let before: Vec<PathBuf> = std::env::split_paths(current).collect();
     let mut dirs: Vec<PathBuf> = Vec::new();
     for dir in std::env::split_paths(shell).chain(before.iter().cloned()) {
@@ -169,7 +196,7 @@ fn merge(shell: &str, current: &str) -> (String, usize) {
     let added = dirs.iter().filter(|d| !before.contains(d)).count();
     // Every entry came out of a split on ':', so none of them holds one and
     // joining cannot fail.
-    let path = std::env::join_paths(&dirs).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| shell.to_string());
+    let path = std::env::join_paths(&dirs).unwrap_or_else(|_| OsString::from(shell));
     (path, added)
 }
 
@@ -192,11 +219,12 @@ mod tests {
 
     #[test]
     fn only_launchds_own_path_is_replaced() {
-        assert!(is_launchd_default("/usr/bin:/bin:/usr/sbin:/sbin"));
-        assert!(is_launchd_default("/bin:/usr/bin"));
-        assert!(is_launchd_default(""));
-        assert!(!is_launchd_default("/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"));
-        assert!(!is_launchd_default("/usr/local/bin:/usr/bin:/bin"));
+        let launchd = |p: &str| is_launchd_default(OsStr::new(p));
+        assert!(launchd("/usr/bin:/bin:/usr/sbin:/sbin"));
+        assert!(launchd("/bin:/usr/bin"));
+        assert!(launchd(""));
+        assert!(!launchd("/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"));
+        assert!(!launchd("/usr/local/bin:/usr/bin:/bin"));
     }
 
     #[test]
@@ -214,9 +242,24 @@ mod tests {
 
     #[test]
     fn the_shells_directories_go_first_and_none_twice() {
-        let (path, added) = merge("/opt/homebrew/bin:/usr/bin:/bin", "/usr/bin:/bin:/usr/sbin:/sbin");
+        let (path, added) = merge("/opt/homebrew/bin:/usr/bin:/bin", OsStr::new("/usr/bin:/bin:/usr/sbin:/sbin"));
         assert_eq!(path, "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin");
         assert_eq!(added, 1);
+    }
+
+    #[test]
+    fn a_directory_that_is_not_utf8_survives_the_merge() {
+        use std::os::unix::ffi::OsStrExt;
+        let current = OsStr::from_bytes(b"/usr/bin:/Users/me/\xffbin");
+        let (path, _) = merge("/opt/homebrew/bin", current);
+        assert_eq!(path.as_bytes(), b"/opt/homebrew/bin:/usr/bin:/Users/me/\xffbin");
+    }
+
+    #[test]
+    fn the_accounts_shell_is_read_from_dscl() {
+        assert_eq!(account_shell("UserShell: /opt/homebrew/bin/fish\n"), Some(PathBuf::from("/opt/homebrew/bin/fish")));
+        assert_eq!(account_shell("No such key: UserShell\n"), None);
+        assert_eq!(account_shell(""), None);
     }
 
     /// The whole of it against a real zsh, with a `.zshrc` that greets and
