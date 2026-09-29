@@ -138,13 +138,19 @@ fn is_launchd_default(path: &OsStr) -> bool {
 fn read(shell: &Path, env: &[(&str, &str)], timeout: Duration) -> Result<String, String> {
     use std::os::unix::process::CommandExt;
     let mut cmd = Command::new(shell);
-    cmd.args(shell_args(shell))
+    let (args, script) = shell_args(shell);
+    cmd.args(args)
         .envs(env.iter().copied())
         .process_group(0)
-        .stdin(Stdio::null())
+        .stdin(if script.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     let mut child = cmd.spawn().map_err(|e| format!("could not start {}: {e}", shell.display()))?;
+    if let (Some(script), Some(mut stdin)) = (script, child.stdin.take()) {
+        // Dropped at the end of this block: the shell reads end-of-file after the
+        // script, and exits instead of waiting for more.
+        let _ = std::io::Write::write_all(&mut stdin, script.as_bytes());
+    }
     let stdout = child.stdout.take().ok_or("no stdout")?;
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -180,16 +186,20 @@ fn read(shell: &Path, env: &[(&str, &str)], timeout: Duration) -> Result<String,
     found
 }
 
-/// How to ask `shell` for its PATH. csh and tcsh take `-l` only as their
-/// sole option, so they cannot be both a login shell and run a command;
-/// they read `.cshrc` on every start, which is where their users set PATH.
-fn shell_args(shell: &Path) -> Vec<String> {
+/// How to ask `shell` for its PATH: its arguments, and what to write to its
+/// stdin, if anything. The same startup files a terminal's new window reads,
+/// so the PATH is the one the user sees there.
+///
+/// csh and tcsh take `-l` only as their sole option, so they cannot be told
+/// a command with `-c` and still be login shells, which read `~/.login`.
+/// They get `-l` alone and the command on stdin instead.
+fn shell_args(shell: &Path) -> (Vec<String>, Option<String>) {
     let command = format!("echo {MARKER}; /usr/bin/printenv PATH");
     let name = shell.file_name().and_then(OsStr::to_str).unwrap_or_default();
     if matches!(name, "csh" | "tcsh") {
-        vec!["-c".into(), command]
+        (vec!["-l".into()], Some(format!("{command}\n")))
     } else {
-        vec!["-l".into(), "-i".into(), "-c".into(), command]
+        (vec!["-l".into(), "-i".into(), "-c".into(), command], None)
     }
 }
 
@@ -308,8 +318,10 @@ mod tests {
     #[test]
     fn tcsh_is_asked_the_way_it_accepts() {
         let home = zdotdir("");
-        std::fs::write(home.join(".cshrc"), "echo 'Welcome back!'\nsetenv PATH /opt/divixi-test/bin:${PATH}\n").unwrap();
+        std::fs::write(home.join(".cshrc"), "echo 'Welcome back!'\nsetenv PATH /opt/divixi-cshrc/bin:${PATH}\n").unwrap();
+        std::fs::write(home.join(".login"), "setenv PATH /opt/divixi-login/bin:${PATH}\n").unwrap();
         let path = read(Path::new("/bin/tcsh"), &[("HOME", home.to_str().unwrap())], Duration::from_secs(20)).unwrap();
-        assert!(path.starts_with("/opt/divixi-test/bin:"), "{path}");
+        assert!(path.contains("/opt/divixi-cshrc/bin"), "{path}");
+        assert!(path.contains("/opt/divixi-login/bin"), "~/.login was not read: {path}");
     }
 }
