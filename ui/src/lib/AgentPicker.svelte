@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { store, agentLabel, workerAgentOf, workerConfigOf, type Role } from "./store.svelte";
+  import { store, agentLabel, workerAgentOf, workerConfigOf, GRAPH_KIND, type Role, type OptionConfig } from "./store.svelte";
+  import { choiceList } from "./agentOptions";
 
   /** In an artifact there is one agent, the artifact's. */
   const artifactMode = $derived(store.chatArtifact);
@@ -13,26 +14,54 @@
    * the chosen agent's models on the right, the track's full settings a
    * click away. Kiro Crew's agent menu, folded around our two roles.
    */
+  /**
+   * Something else to pick for than the conversation on screen (a routine's
+   * run): its agent and options, how to change them, the label and the line
+   * under the lists. Without it, the picker is the conversation's.
+   */
+  type Target = {
+    label: string;
+    agent: string;
+    config: OptionConfig;
+    note?: string;
+    /** It picks the planning agent, which works in a mode that asks (whatever the agent's own). */
+    planning?: boolean;
+    setAgent: (agent: string) => void;
+    setOption: (id: string, value: string) => void;
+  };
+  let { target }: { target?: Target } = $props();
+
   let open = $state(false);
   let role = $state<Role>("conductor");
   let filter = $state("");
 
   const track = $derived(store.currentTrack);
-  const agent = $derived(store.roleAgent(role));
-  const config = $derived(store.roleConfig(role));
+  const agent = $derived(target ? target.agent : store.roleAgent(role));
+  const config = $derived(target ? target.config : store.roleConfig(role));
   const options = $derived(store.optionsOf(agent));
   const modelOption = $derived(options.find((o) => o.category === "model"));
   const modeOption = $derived(options.find((o) => o.category === "mode"));
 
-  const modelInEffect = $derived(modelOption ? store.effective(agent, config, modelOption) : "");
-  const chosenModel = $derived(modelOption ? (config[modelOption.id] ?? "") : "");
   const modeInEffect = $derived(modeOption ? store.effective(agent, config, modeOption) : store.autonomousModeOf(agent));
 
+  // The agent's models only: nothing saved shows its current one picked.
   const models = $derived(
-    (modelOption?.choices ?? []).filter((c) => {
+    (modelOption ? choiceList(modelOption, config[modelOption.id]) : []).filter((c) => {
       const q = filter.trim().toLowerCase();
       return !q || `${c.id} ${c.name} ${c.group ?? ""}`.toLowerCase().includes(q);
     }),
+  );
+
+  /** A plan's agent: its mode is set by the core (one that asks), so no mode is shown. */
+  const planning = $derived(target ? target.planning === true : artifactMode && store.currentArtifact?.kind === "plan");
+
+  /** Whom the menu picks for, for a screen reader (not drawn: the chip and panel say it). */
+  const menuLabel = $derived(
+    target
+      ? target.label
+      : artifactMode
+        ? t(store.currentArtifact?.kind === "plan" ? "plan.agentLabel" : store.currentArtifact?.kind === GRAPH_KIND ? "kb.agentLabel" : "design.agentLabel")
+        : t("picker.title"),
   );
 
   /** Mode ids like `…/session-modes#autopilot` read as their last segment. */
@@ -42,6 +71,10 @@
 
   /** What the chip says: the conductor, and the workers when they differ. */
   const summary = $derived.by(() => {
+    if (target) {
+      const m = store.optionsOf(target.agent).find((o) => o.category === "model");
+      return { conductor: agentLabel(target.agent), model: m ? store.choiceName(m, store.effective(target.agent, target.config, m)) : "", workers: "" };
+    }
     const d = artifactMode ? store.currentArtifact : undefined;
     if (d) {
       const m = store.optionsOf(d.agent).find((o) => o.category === "model");
@@ -64,11 +97,14 @@
   });
 
   function pickAgent(id: string) {
-    void store.setRoleAgent(role, id);
+    if (target) target.setAgent(id);
+    else void store.setRoleAgent(role, id);
   }
 
   function pickModel(id: string) {
-    if (modelOption) void store.setRoleOption(role, modelOption.id, id);
+    if (!modelOption) return;
+    if (target) target.setOption(modelOption.id, id);
+    else void store.setRoleOption(role, modelOption.id, id);
   }
 
   function openSettings() {
@@ -77,9 +113,12 @@
   }
 </script>
 
-<Popover bind:open width={520}>
+<Popover bind:open width={520} label={menuLabel}>
   {#snippet trigger()}
     <button class="chip" onclick={() => (open = !open)} title={t("picker.title")} aria-haspopup="dialog" aria-expanded={open}>
+      {#if target}
+        <span class="mono tlabel">{target.label}</span>
+      {:else}
       <!-- The conductor session: grey closed, green open, pulsing while it opens or answers. -->
       <span
         class="sess"
@@ -87,25 +126,25 @@
         style="background: {(artifactMode ? store.artifactSession.open : store.conductorState.open || store.conductorOpening === store.track) ? 'var(--ok)' : 'var(--idle)'}"
         title={(artifactMode ? store.artifactSession.open : store.conductorState.open) ? t("picker.sessionOpen") : t("picker.sessionClosed")}
       ></span>
+      {/if}
       <Icon name="bot" size={14} />
       <!-- One line, cut with an ellipsis when the column is narrow; never wrapped. -->
       <span class="label mono">
         {summary.conductor}{#if summary.model}<span class="dim">{summary.model}</span>{/if}{#if summary.workers}<span class="sep">/</span><span class="dim">{t("picker.worker")}</span><span>{summary.workers}</span>{/if}
       </span>
+      {#if target}<span class="caret">▾</span>{/if}
     </button>
   {/snippet}
 
   <div class="head">
-    {#if artifactMode}
-      <span class="mono role on">{t("design.agentLabel")}</span>
-    {:else}
+    {#if !target && !artifactMode}
     <div class="roles" role="tablist">
       <button class="role mono" class:on={role === "conductor"} role="tab" aria-selected={role === "conductor"} onclick={() => (role = "conductor")}>{t("picker.conductor")}</button>
       <button class="role mono" class:on={role === "worker"} role="tab" aria-selected={role === "worker"} onclick={() => (role = "worker")}>{t("picker.worker")}</button>
     </div>
     {/if}
     <span class="grow"></span>
-    {#if modeInEffect}
+    {#if modeInEffect && !planning}
       <span class="mono modetag" title={t("composer.modeTitle")}>{t("picker.mode")} · {modeKey(modeInEffect)}</span>
     {/if}
   </div>
@@ -135,20 +174,13 @@
       {#if !modelOption}
         <div class="mono none">{t("picker.noModels")}</div>
       {:else}
-        <button class="opt" class:on={!chosenModel} onclick={() => pickModel("")}>
-          <span class="col2">
-            <span class="mono id">{t("picker.default")}</span>
-            <span class="desc">{store.choiceName(modelOption, modelOption.current)}</span>
-          </span>
-          {#if !chosenModel}<span class="mono check">✓</span>{/if}
-        </button>
         {#each models as c (c.id)}
-          <button class="opt" class:on={chosenModel === c.id} onclick={() => pickModel(c.id)}>
+          <button class="opt" class:on={c.on} onclick={() => pickModel(c.id)}>
             <span class="col2">
               <span class="mono id">{c.name}</span>
               <span class="desc">{c.id}{c.group ? ` · ${c.group}` : ""}{c.description ? ` · ${c.description}` : ""}</span>
             </span>
-            {#if chosenModel === c.id}<span class="mono check">✓</span>{:else if modelInEffect === c.id}<span class="mono dim">now</span>{/if}
+            {#if c.missing}<span class="mono dim">{t("picker.missing")}</span>{/if}{#if c.now}<span class="mono dim">now</span>{/if}{#if c.on}<span class="mono check">✓</span>{/if}
           </button>
         {/each}
       {/if}
@@ -156,8 +188,10 @@
   </div>
 
   <div class="foot mono">
-    {#if artifactMode}
-      <span class="dim">{store.artifactSession.open ? t("picker.sessionOpen") : t("design.sessionNext")}</span>
+    {#if target}
+      <span class="dim">{target.note ?? ""}</span>
+    {:else if artifactMode}
+      <span class="dim">{store.artifactSession.open ? t("picker.sessionOpen") : t("panel.sessionNext")}</span>
     {:else}
     <span class="dim">{store.conductorState.open ? t("picker.sessionOpen") : t("picker.sessionClosed")}</span>
     {#if store.conductorState.open}
@@ -407,5 +441,16 @@
     font-size: 10px;
     letter-spacing: 0.1em;
     padding: 0;
+  }
+
+  .caret {
+    font-size: 9px;
+    color: var(--lab);
+  }
+
+  .tlabel {
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    color: var(--lab);
   }
 </style>

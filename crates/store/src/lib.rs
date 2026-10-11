@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bump when `SCHEMA` changes in a way that needs a migration, and add the
 /// step to [`migrate`].
-const SCHEMA_VERSION: i64 = 20;
+const SCHEMA_VERSION: i64 = 22;
 
 /// Migration steps, applied in order from the stored version to
 /// [`SCHEMA_VERSION`]. Step `i` upgrades from version `i + 1` to `i + 2`.
@@ -249,6 +249,18 @@ const MIGRATIONS: &[&str] = &[
     DROP TABLE routines;
     ALTER TABLE routines_rebuilt RENAME TO routines;
     CREATE INDEX IF NOT EXISTS routines_by_time ON routines(updated_at);",
+    // 20 -> 21: a routine may carry a plan: the artifact (kind 'plan') that
+    // holds its steps and the conversation that shaped them. Empty is no
+    // plan, and the routine runs on its instruction alone, as before. A run
+    // keeps the plan it was given beyond its instruction, and what its agent
+    // said of each step; both stay empty for a run without a plan.
+    "ALTER TABLE routines ADD COLUMN plan TEXT NOT NULL DEFAULT '';
+    ALTER TABLE routine_runs ADD COLUMN plan TEXT NOT NULL DEFAULT '';
+    ALTER TABLE routine_runs ADD COLUMN steps TEXT NOT NULL DEFAULT '';",
+    // 21 -> 22: a routine's colour and tags, as a track's and a design's: the
+    // bar beside it in its list and the tags shown above its name.
+    "ALTER TABLE routines ADD COLUMN color TEXT NOT NULL DEFAULT '';
+    ALTER TABLE routines ADD COLUMN tags TEXT NOT NULL DEFAULT '[]';",
 ];
 
 const SCHEMA: &str = r#"
@@ -347,7 +359,12 @@ CREATE TABLE IF NOT EXISTS routines (
     agent       TEXT    NOT NULL,
     config      TEXT    NOT NULL DEFAULT '{}',
     created_at  INTEGER NOT NULL,
-    updated_at  INTEGER NOT NULL
+    updated_at  INTEGER NOT NULL,
+    -- Its plan: the id of an artifact of kind 'plan', or empty for none.
+    plan        TEXT    NOT NULL DEFAULT '',
+    -- `#rrggbb` for the bar beside it in its list, or empty.
+    color       TEXT    NOT NULL DEFAULT '',
+    tags        TEXT    NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS routines_by_time ON routines(updated_at);
 
@@ -371,7 +388,11 @@ CREATE TABLE IF NOT EXISTS routine_runs (
     error       TEXT    NOT NULL DEFAULT '',
     tools       INTEGER NOT NULL DEFAULT 0,
     -- The checked report, as JSON; empty when there was none to check.
-    report      TEXT    NOT NULL DEFAULT ''
+    report      TEXT    NOT NULL DEFAULT '',
+    -- The plan it was given, as it read then (JSON); empty for none.
+    plan        TEXT    NOT NULL DEFAULT '',
+    -- What its agent said of each step of that plan (JSON); empty for none.
+    steps       TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS routine_runs_by_routine ON routine_runs(routine, started_at);
 
@@ -601,6 +622,19 @@ pub struct Routine {
     pub runs: u32,
     /// Its most recent run, when it has one.
     pub last_run: Option<String>,
+    /// When its most recent run started (Unix milliseconds), when it has one.
+    /// Not `updated_at`, which an edit moves too.
+    #[serde(default)]
+    pub last_run_at: Option<i64>,
+    /// Its plan: the id of an artifact of kind `plan`, or empty for none.
+    /// Set by opening the plan, never by a patch.
+    #[serde(default)]
+    pub plan: String,
+    /// `#rrggbb` for the bar beside it in its list, or empty.
+    #[serde(default)]
+    pub color: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// What a routine change may touch; `None` keeps a field.
@@ -611,6 +645,10 @@ pub struct RoutinePatch {
     pub cwd: Option<String>,
     pub agent: Option<String>,
     pub config: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub color: Option<String>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
 }
 
 fn row_to_routine(r: &rusqlite::Row<'_>) -> rusqlite::Result<Routine> {
@@ -625,6 +663,10 @@ fn row_to_routine(r: &rusqlite::Row<'_>) -> rusqlite::Result<Routine> {
         updated_at: r.get(7)?,
         runs: r.get(8)?,
         last_run: r.get(9)?,
+        plan: r.get(10)?,
+        color: r.get(11)?,
+        tags: serde_json::from_str(&r.get::<_, String>(12)?).unwrap_or_default(),
+        last_run_at: r.get(13)?,
     })
 }
 
@@ -634,7 +676,9 @@ const ROUTINE_SELECT: &str = "SELECT r.id, r.name, r.instruction, r.cwd, r.agent
                                      r.created_at, r.updated_at,
                                      (SELECT COUNT(*) FROM routine_runs x WHERE x.routine = r.id),
                                      (SELECT x.id FROM routine_runs x WHERE x.routine = r.id
-                                      ORDER BY x.started_at DESC LIMIT 1)
+                                      ORDER BY x.started_at DESC LIMIT 1),
+                                     r.plan, r.color, r.tags,
+                                     (SELECT MAX(x.started_at) FROM routine_runs x WHERE x.routine = r.id)
                               FROM routines r";
 
 /// Where one run of a routine stands.
@@ -699,11 +743,19 @@ pub struct RoutineRun {
     pub tools: u32,
     /// The checked report, when the run left one.
     pub report: Option<serde_json::Value>,
+    /// The plan it was given beyond its instruction, as it read then.
+    #[serde(default)]
+    pub plan: Option<serde_json::Value>,
+    /// What its agent said of each step of that plan.
+    #[serde(default)]
+    pub steps: Option<serde_json::Value>,
 }
 
 fn row_to_routine_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<RoutineRun> {
     let status: String = r.get(5)?;
     let report: String = r.get(11)?;
+    let plan: String = r.get(12)?;
+    let steps: String = r.get(13)?;
     Ok(RoutineRun {
         id: r.get(0)?,
         routine: r.get(1)?,
@@ -717,11 +769,13 @@ fn row_to_routine_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<RoutineRun> {
         error: r.get(9)?,
         tools: r.get(10)?,
         report: serde_json::from_str(&report).ok(),
+        plan: serde_json::from_str(&plan).ok(),
+        steps: serde_json::from_str(&steps).ok(),
     })
 }
 
 const ROUTINE_RUN_SELECT: &str = "SELECT id, routine, agent, cwd, instruction, status, started_at,
-                                         ended_at, output, error, tools, report
+                                         ended_at, output, error, tools, report, plan, steps
                                   FROM routine_runs";
 
 const ARTIFACT_SELECT: &str = "SELECT id, kind, title, agent, config, color, tags, created_at, updated_at FROM artifacts";
@@ -1176,11 +1230,13 @@ impl Store {
     /// Change a routine's fields; `None` in the patch keeps a field.
     pub fn update_routine(&self, id: &str, patch: &RoutinePatch) -> anyhow::Result<Routine> {
         let config = patch.config.as_ref().map(serde_json::to_string).transpose()?;
+        let tags = patch.tags.as_ref().map(serde_json::to_string).transpose()?;
         {
             let conn = self.conn.lock();
             let changed = conn.execute(
                 "UPDATE routines SET name = COALESCE(?2, name), instruction = COALESCE(?3, instruction),
                  cwd = COALESCE(?4, cwd), agent = COALESCE(?5, agent), config = COALESCE(?6, config),
+                 color = COALESCE(?8, color), tags = COALESCE(?9, tags),
                  updated_at = ?7
                  WHERE id = ?1",
                 params![
@@ -1191,13 +1247,32 @@ impl Store {
                     patch.agent.as_deref().map(str::trim).filter(|v| !v.is_empty()),
                     config,
                     now_ms(),
+                    patch.color.as_deref().map(str::trim),
+                    tags,
                 ],
             )?;
             if changed == 0 {
                 anyhow::bail!("no routine {id}");
             }
         }
-        Ok(self.routine(id)?.expect("just updated"))
+        // Deleted in between (another window, the phone): said, not a panic.
+        self.routine(id)?.ok_or_else(|| anyhow::anyhow!("no routine {id}"))
+    }
+
+    /// Link a routine to its plan (an artifact of kind `plan`), or unlink it
+    /// with an empty id. Not a patch field, and it leaves `updated_at`
+    /// alone: the list is ordered by when a routine last ran or changed,
+    /// and opening its plan is neither.
+    pub fn set_routine_plan(&self, id: &str, plan: &str) -> anyhow::Result<Routine> {
+        {
+            let conn = self.conn.lock();
+            let changed = conn.execute("UPDATE routines SET plan = ?2 WHERE id = ?1", params![id, plan])?;
+            if changed == 0 {
+                anyhow::bail!("no routine {id}");
+            }
+        }
+        // Deleted in between (another window, the phone): said, not a panic.
+        self.routine(id)?.ok_or_else(|| anyhow::anyhow!("no routine {id}"))
     }
 
     /// Remove a routine and everything its runs left behind. Unlike a
@@ -1270,6 +1345,26 @@ impl Store {
             "UPDATE routines SET updated_at = ?2 WHERE id = (SELECT routine FROM routine_runs WHERE id = ?1)",
             params![id, now_ms()],
         )?;
+        Ok(())
+    }
+
+    /// Keep the plan a run of a routine was given beyond its instruction, as
+    /// it read then. Like the instruction, it is the run's own copy: the plan
+    /// changing afterwards does not rewrite what this run was asked to do.
+    pub fn set_routine_run_plan(&self, id: &str, plan: &serde_json::Value) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        if conn.execute("UPDATE routine_runs SET plan = ?2 WHERE id = ?1", params![id, serde_json::to_string(plan)?])? == 0 {
+            anyhow::bail!("no routine run {id}");
+        }
+        Ok(())
+    }
+
+    /// Keep what a run's agent said of each step of its plan.
+    pub fn set_routine_run_steps(&self, id: &str, steps: &serde_json::Value) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        if conn.execute("UPDATE routine_runs SET steps = ?2 WHERE id = ?1", params![id, serde_json::to_string(steps)?])? == 0 {
+            anyhow::bail!("no routine run {id}");
+        }
         Ok(())
     }
 
@@ -2328,6 +2423,7 @@ mod tests {
                 cwd: Some(r"\\?\UNC\srv\share\ops".into()),
                 agent: Some("claude_code".into()),
                 config: None,
+                ..RoutinePatch::default()
             })
             .unwrap();
         assert_eq!(ro.cwd, r"\\srv\share\ops");
@@ -2364,6 +2460,7 @@ mod tests {
             cwd: Some("C:/ops".into()),
             agent: Some("claude_code".into()),
             config: None,
+            ..RoutinePatch::default()
         };
         let a = store.create_routine(&made()).unwrap();
         assert_eq!((a.id.as_str(), a.name.as_str()), ("ro001", "Dependency check"), "ids run on, names are trimmed");
@@ -2417,6 +2514,95 @@ mod tests {
         assert!(store.delete_routine(&a.id).is_err(), "deleting what is gone says so");
     }
 
+    /// A routine's plan is a link to an artifact, set apart from a patch, and
+    /// a run without a plan reads as one: nothing in the new columns.
+    #[test]
+    fn a_routine_links_to_its_plan() {
+        let store = Store::in_memory().unwrap();
+        let r = store
+            .create_routine(&RoutinePatch {
+                name: Some("deps".into()),
+                instruction: Some("check".into()),
+                cwd: Some("/w".into()),
+                agent: Some("codex".into()),
+                config: None,
+                ..RoutinePatch::default()
+            })
+            .unwrap();
+        assert_eq!(r.plan, "", "a routine starts without a plan");
+        let plan = store.create_artifact("plan", "deps", "claude_code", "{}").unwrap();
+        let linked = store.set_routine_plan(&r.id, &plan.id).unwrap();
+        assert_eq!(linked.plan, plan.id);
+        assert_eq!(linked.updated_at, r.updated_at, "opening a plan does not move the routine up the list");
+        assert_eq!(store.routines().unwrap()[0].plan, plan.id);
+        // An edit to the routine keeps the link.
+        let edited = store.update_routine(&r.id, &RoutinePatch { name: Some("deps 2".into()), ..RoutinePatch::default() }).unwrap();
+        assert_eq!(edited.plan, plan.id);
+        assert!(store.set_routine_plan("ro999", &plan.id).is_err());
+        assert_eq!(store.set_routine_plan(&r.id, "").unwrap().plan, "", "and it can be let go");
+
+        // Its colour and tags, as a track's.
+        let looked = store
+            .update_routine(&r.id, &RoutinePatch { color: Some("#46c46a".into()), tags: Some(vec!["ops".into(), "weekly".into()]), ..RoutinePatch::default() })
+            .unwrap();
+        assert_eq!((looked.color.as_str(), looked.tags.clone()), ("#46c46a", vec!["ops".to_string(), "weekly".to_string()]));
+        let kept = store.update_routine(&r.id, &RoutinePatch { name: Some("deps 3".into()), ..RoutinePatch::default() }).unwrap();
+        assert_eq!((kept.color, kept.tags.len()), ("#46c46a".to_string(), 2), "a patch without them keeps them");
+        let cleared = store.update_routine(&r.id, &RoutinePatch { color: Some(String::new()), tags: Some(vec![]), ..RoutinePatch::default() }).unwrap();
+        assert_eq!((cleared.color.as_str(), cleared.tags.len()), ("", 0));
+
+        let run = store.begin_routine_run(&r.id, "codex", "/w", "check").unwrap();
+        let read = store.routine_run(&run).unwrap().unwrap();
+        assert_eq!((read.plan, read.steps), (None, None), "a run kept before plans (plan = '', steps = '') reads as none");
+        let ran = store.routine(&r.id).unwrap().unwrap();
+        assert_eq!(ran.last_run_at, Some(read.started_at), "its last run's time, not when it was last edited");
+        store.update_routine(&r.id, &RoutinePatch { color: Some("#7aa2f7".into()), ..RoutinePatch::default() }).unwrap();
+        assert_eq!(store.routine(&r.id).unwrap().unwrap().last_run_at, Some(read.started_at), "an edit does not move it");
+        assert!(store.set_routine_run_plan("rr-none", &serde_json::json!({})).is_err(), "no run, no silent success");
+        assert!(store.set_routine_run_steps("rr-none", &serde_json::json!([])).is_err());
+        assert!(store.update_routine("ro999", &RoutinePatch { name: Some("x".into()), ..RoutinePatch::default() }).is_err());
+
+        // A run given a plan keeps it, and what its agent said of the steps.
+        let given = serde_json::json!({ "version": 3, "steps": [{ "id": "s1", "title": "pull" }] });
+        store.set_routine_run_plan(&run, &given).unwrap();
+        store.set_routine_run_steps(&run, &serde_json::json!([{ "id": "s1", "status": "done", "note": "" }])).unwrap();
+        let read = store.routine_run(&run).unwrap().unwrap();
+        assert_eq!(read.plan.unwrap()["version"], 3);
+        assert_eq!(read.steps.unwrap()[0]["status"], "done");
+        assert_eq!(read.instruction, "check", "the instruction it was sent is its own, as before");
+    }
+
+    /// The run agent (the routine's) and the routine agent (its plan's, who
+    /// works the plan out) are two choices: either changes, the other stays.
+    #[test]
+    fn a_routines_run_agent_and_its_plan_agent_are_apart() {
+        let store = Store::in_memory().unwrap();
+        let r = store
+            .create_routine(&RoutinePatch {
+                name: Some("deps".into()),
+                instruction: Some("check".into()),
+                cwd: Some("/w".into()),
+                agent: Some("codex".into()),
+                config: Some(BTreeMap::from([("model".to_string(), "gpt-5".to_string())])),
+                ..RoutinePatch::default()
+            })
+            .unwrap();
+        let plan = store.create_artifact("plan", "deps", "claude_code", "{}").unwrap();
+        store.set_routine_plan(&r.id, &plan.id).unwrap();
+
+        let plan_config = BTreeMap::from([("model".to_string(), "opus".to_string())]);
+        store
+            .update_artifact(&plan.id, &ArtifactPatch { agent: Some("copilot".into()), config: Some(plan_config.clone()), ..ArtifactPatch::default() })
+            .unwrap();
+        let r2 = store.routine(&r.id).unwrap().unwrap();
+        assert_eq!((r2.agent.as_str(), r2.config.get("model").map(String::as_str)), ("codex", Some("gpt-5")), "the plan's agent leaves the run's alone");
+
+        store.update_routine(&r.id, &RoutinePatch { agent: Some("gemini".into()), config: Some(BTreeMap::new()), ..RoutinePatch::default() }).unwrap();
+        let (p, _) = store.artifact(&plan.id).unwrap().unwrap();
+        assert_eq!((p.agent.as_str(), p.config.clone()), ("copilot", plan_config), "and the run's leaves the plan's alone");
+        assert_eq!(store.routine(&r.id).unwrap().unwrap().agent, "gemini");
+    }
+
     /// The bug this table exists for: a routine ran on the agent a track
     /// used, and its work turned up in that track's history. Every way the
     /// app reaches for runs is asked here, because it only takes one that
@@ -2436,6 +2622,7 @@ mod tests {
                 // is the case that broke, and nothing about it may match.
                 agent: Some("copilot".into()),
                 config: None,
+                ..RoutinePatch::default()
             })
             .unwrap();
         let rr = store.begin_routine_run(&routine.id, "copilot", "C:/repo", "look at the deps").unwrap();

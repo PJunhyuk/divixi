@@ -4,6 +4,8 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { i18n, systemLang, t, type Key, type Lang, type LangPref } from "./i18n.svelte";
 import { picksOf, toggleChip, type Chip } from "./graphContext";
 import { parseTags } from "./listFilter";
+import { ROUTINE_TAGS_KEY } from "./routineFilter";
+import { nextRunsLimit, RUNS_PAGE } from "./planGraph";
 import { libraryPick } from "./libraries";
 import { download, tooLarge } from "./designFile";
 import { notifyDecision, notifyRoutine, resolveDecisions, keepOnlyOpen } from "./notify.svelte";
@@ -31,6 +33,8 @@ import { pickable } from "./agentOptions";
 import { keepsSetting } from "./layoutSettings";
 import { clampZoom, fieldFontPx, foldsOnPick, foldValue, instanceZoomKey, LIST_FOLDS, listAfterRail, parseZoom, settingOpen, WEB_RAIL_KEY, webPanelOpen, type ListFold } from "./uiMemory";
 import { pairing, type Paired } from "./pairing.svelte";
+import { workspaceTarget } from "./workspaceTarget";
+import { sideWidth } from "./crowd";
 import { openKey, parseMemory, pruneOpen, remember, treeReply, underOpen, type WsEntry as WsEntryType } from "./fileTree";
 
 export { wasStopped, errorLife, type Queued, type AppError };
@@ -354,7 +358,8 @@ export type View = "track" | "settings" | "worker" | "new-track" | "edit-track" 
 
 // ----- artifacts: what the human keeps beside tracks and attaches to them —
 // designs (a sketch board worked out with an agent), knowledge later -----
-export type ArtifactKind = "design" | "knowledge" | "graph";
+/** `plan` is a routine's plan: reached through its routine, never listed with the rest. */
+export type ArtifactKind = "design" | "knowledge" | "graph" | "plan";
 export type ArtifactInfo = {
   id: string;
   kind: ArtifactKind;
@@ -391,6 +396,13 @@ export type Routine = {
   updated_at: number;
   runs: number;
   last_run: string | null;
+  /** When its last run started (Unix ms); null before any. Not `updated_at`, which an edit moves. */
+  last_run_at?: number | null;
+  /** Its plan: the id of an artifact of kind `plan`, or empty for none. */
+  plan?: string;
+  /** `#rrggbb` for the bar beside it in its list, or empty. */
+  color?: string;
+  tags?: string[];
 };
 
 /** Where one run of a routine stands. Its own words: a worker run's `done`
@@ -415,6 +427,10 @@ export type RoutineRun = {
   tools: number;
   /** The checked report, when the run left one. */
   report: WorkerReport | null;
+  /** The plan it was given beyond its instruction, as it read then. */
+  plan?: { version: number; steps: { id: string; title: string }[] } | null;
+  /** What its agent said of each step of that plan. */
+  steps?: unknown;
 };
 
 export type Stroke = { points: [number, number, number][]; color: string; size: number };
@@ -1024,12 +1040,52 @@ class Store {
 
   async setDesignChat(open: boolean) {
     this.designChatOpen = open;
-    if (!this.keeps("designchat")) return;
-    try {
-      await invoke("set_setting", { key: "designchat", value: open ? "open" : "closed" });
-    } catch (err) {
-      this.lastError = String(err);
+    if (open && this.designFilesOpen) void this.setDesignFiles(false);
+    this.keepSide("designchat", open);
+  }
+
+  /**
+   * The right of the designs page and of a routine: its agent (the robot) or
+   * its folder as files (the panel icon, as beside a track) -- one at a time,
+   * as a track has one column on its right. Kept like the design's agent
+   * column: on this PC's own Divixi, as it was left.
+   */
+  designFilesOpen = $state(false);
+  planFilesOpen = $state(false);
+
+  async setDesignFiles(open: boolean) {
+    this.designFilesOpen = open;
+    if (open && this.designChatOpen) void this.setDesignChat(false);
+    this.keepSide("designfiles", open);
+  }
+
+  async setPlanChat(open: boolean) {
+    this.planChatOpen = open;
+    if (open && this.planFilesOpen) void this.setPlanFiles(false);
+    this.keepSide("planchat", open);
+  }
+
+  async setPlanFiles(open: boolean) {
+    this.planFilesOpen = open;
+    if (open && this.planChatOpen) void this.setPlanChat(false);
+    this.keepSide("planfiles", open);
+  }
+
+  private keepSide(key: string, open: boolean) {
+    if (!this.keeps(key)) return;
+    invoke("set_setting", { key, value: open ? "open" : "closed" }).catch((err) => (this.lastError = String(err)));
+  }
+
+  /** The side panels as they were left (the design's agent is restored with the rest of the layout). */
+  async restoreSides() {
+    const read = async (key: string) => (this.keeps(key) ? await invoke<string | null>("get_setting", { key }).catch(() => null) : null);
+    const [df, pc, pf] = await Promise.all([read("designfiles"), read("planchat"), read("planfiles")]);
+    if (df === "open") {
+      this.designFilesOpen = true;
+      this.designChatOpen = false;
     }
+    this.planChatOpen = pc === "open";
+    this.planFilesOpen = pf === "open" && !this.planChatOpen;
   }
 
   /**
@@ -1040,8 +1096,21 @@ class Store {
   get chatArtifactId(): string {
     if (this.view === "design") return this.artifact;
     if (this.view === "knowledge" && this.graphChatOpen) return this.graphChat;
+    if (this.view === "routines" && this.planChatOpen && this.planInfo) return this.planInfo.id;
     return "";
   }
+
+  /**
+   * The open routine's plan, as an artifact (its agent and options), when it
+   * has one and it is open. Plans are left out of `artifacts` (the core lists
+   * them only when asked by kind), so the one on screen is held here; the
+   * plan itself is plan.svelte.ts's.
+   */
+  planInfo = $state<ArtifactInfo | null>(null);
+  /** Whether the plan's agent is open beside the routine. */
+  planChatOpen = $state(false);
+  /** Steps picked on the plan: they go with the next message to its agent. */
+  planSelected = $state<string[]>([]);
 
   /**
    * What the person picked for the on-screen artifact conversation's next
@@ -1049,11 +1118,13 @@ class Store {
    * not the library on screen, which goes along but is not a message.
    */
   get chatPicks(): string[] {
+    if (this.view === "routines") return this.planSelected;
     return this.view === "design" ? this.designSelected : picksOf(this.graphChips, this.graphExcluded);
   }
 
   /** What goes with the on-screen artifact conversation's next message. */
   get chatSelected(): string[] {
+    if (this.view === "routines") return this.planSelected;
     return this.view === "design" ? this.designSelected : this.graphSelected;
   }
   /** The open artifact's agent session. */
@@ -1251,6 +1322,14 @@ class Store {
     await this.keepList("designlist_tags", tags);
   }
 
+  /** The tags the routines column is narrowed to (every one of them). Kept as the designs' are. */
+  routineTags = $state<string[]>([]);
+
+  async setRoutineTags(tags: string[]) {
+    this.routineTags = tags;
+    await this.keepList(ROUTINE_TAGS_KEY, tags);
+  }
+
   async setKbTags(tags: string[]) {
     this.kbTags = tags;
     await this.keepList("kblist_tags", tags);
@@ -1294,6 +1373,15 @@ class Store {
   setTrackListWidth(px: number, persist = false) {
     this.trackListWidth = Math.min(480, Math.max(200, Math.round(px)));
     if (persist) this.persistWidth("tracklist_width", this.trackListWidth);
+  }
+
+  /** The window's width (App keeps it), for side panels that must leave the page room. */
+  windowWidth = $state(typeof window === "undefined" ? 1280 : window.innerWidth);
+
+  /** A side panel's width as drawn on a desktop window (a phone lays panels over the page). */
+  sideWidth(px: number): number {
+    if (this.windowWidth < 640) return px;
+    return sideWidth(this.windowWidth, this.railCollapsed ? 48 : this.railWidth, px);
   }
 
   setPanelWidth(px: number, persist = false) {
@@ -1353,10 +1441,44 @@ class Store {
 
   /** Where this track's open folders are remembered: the track and its folder. */
   private get wsKey(): string {
-    const track = this.track;
-    if (!track) return "";
-    return openKey(track, this.tracks.find((tr) => tr.id === track)?.cwd ?? "");
+    const target = this.wsTarget;
+    if (!target) return "";
+    const cwd = this.tracks.find((tr) => tr.id === target)?.cwd ?? this.routines.find((r) => `routine:${r.id}` === target)?.cwd ?? target;
+    return openKey(target, cwd);
   }
+
+  /**
+   * Whose folder the file browser shows: the track's on a track; beside a
+   * routine its folder (`routine:<id>`), beside a design the design's own
+   * (`artifact:<id>`). The core reads the prefix (track_root); every
+   * workspace command and the preview take it as they take a track.
+   */
+  get wsTarget(): string {
+    return workspaceTarget(this.view, this.routine, this.artifact, this.track, NEW_ROUTINE);
+  }
+
+  /** The target the panel's rows were read for. */
+  private wsLoaded = "";
+
+  /** When the browser now shows another folder, forget the last one's rows and read this one's. */
+  syncWorkspace() {
+    const target = this.wsTarget;
+    if (target === this.wsLoaded) return;
+    // The files open beside each page stay open for when it comes back: a
+    // look at a routine's folder does not close the track's tabs.
+    if (this.wsLoaded) this.wsTabs.set(this.wsLoaded, { open: this.openFiles, active: this.activeFile });
+    this.clearWorkspace();
+    this.wsLoaded = target;
+    const kept = this.wsTabs.get(target);
+    if (kept) {
+      this.openFiles = kept.open;
+      this.activeFile = kept.active;
+    }
+    if (target) void this.refreshWorkspace();
+  }
+
+  /** The files each folder had open, by target, for the time the app runs. */
+  private wsTabs = new Map<string, { open: string[]; active: string }>();
 
   /** The folders the file browser has open on the track showing now. */
   openDirs(): string[] {
@@ -1391,9 +1513,14 @@ class Store {
   private setOpenDirs(open: string[]) {
     const key = this.wsKey;
     if (!key) return;
-    this.wsOpen = remember(this.wsOpen, key, open, new Set(this.tracks.map((tr) => tr.id)));
+    this.wsOpen = remember(this.wsOpen, key, open, this.wsLive());
     if (!this.keeps(WS_OPEN_SETTING)) return;
     invoke("set_setting", { key: WS_OPEN_SETTING, value: JSON.stringify(this.wsOpen) }).catch(tracing);
+  }
+
+  /** Keys the open-folder memory keeps: every track, routine and design there is. */
+  private wsLive(): Set<string> {
+    return new Set([...this.tracks.map((tr) => tr.id), ...this.routines.map((r) => `routine:${r.id}`), ...this.artifacts.map((a) => `artifact:${a.id}`)]);
   }
 
   private async restoreWsOpen() {
@@ -1423,10 +1550,10 @@ class Store {
 
   /** Reload the tree, the git status and every open file. */
   async refreshWorkspace() {
-    if (!this.track) return;
+    if (!this.wsTarget) return;
     // The whole-folder list is read again only if something already asked
     // for it; nothing here starts that walk on its own.
-    const hadFiles = this.fileListOf === this.track;
+    const hadFiles = this.fileListOf === this.wsTarget;
     this.fileListOf = "";
     await Promise.all([
       this.loadTree(),
@@ -1443,7 +1570,7 @@ class Store {
    * that are no longer on disk drop out of the memory here, quietly.
    */
   async loadTree() {
-    const track = this.track;
+    const track = this.wsTarget;
     if (!track) return;
     // Opening one folder after another leaves more than one listing in
     // flight; only the newest lands, so the rows cannot fall behind.
@@ -1452,7 +1579,7 @@ class Store {
     this.treeLoading = true;
     try {
       const [entries, cut] = treeReply(await invoke("workspace_tree", { track, open: asked }));
-      if (this.track !== track || seq !== this.treeSeq) return;
+      if (this.wsTarget !== track || seq !== this.treeSeq) return;
       this.tree = entries;
       this.treeCut = cut;
       const left = pruneOpen(asked, entries, cut);
@@ -1470,39 +1597,39 @@ class Store {
 
   /** Whether the rows in hand are this track's, so "no files" can be believed. */
   get treeReady(): boolean {
-    return !!this.track && this.treeOf === this.track;
+    return !!this.wsTarget && this.treeOf === this.wsTarget;
   }
 
   /** The same for the whole-folder list the name filter draws. */
   get fileListReady(): boolean {
-    return !!this.track && this.fileListOf === this.track;
+    return !!this.wsTarget && this.fileListOf === this.wsTarget;
   }
 
   /** Every file under the track folder, for searching by name and for `@`. */
   async loadFileList() {
-    const track = this.track;
+    const track = this.wsTarget;
     if (!track || this.fileListLoading || this.fileListOf === track) return;
     this.fileListLoading = true;
     try {
       const [entries] = treeReply(await invoke("workspace_tree", { track, open: null }));
-      if (this.track === track) this.fileList = entries;
+      if (this.wsTarget === track) this.fileList = entries;
     } catch (err) {
       this.lastError = String(err);
     } finally {
       this.fileListLoading = false;
       // Marked read even when it failed, so a filter does not set the
       // whole walk going again on every keystroke; a refresh tries afresh.
-      if (this.track === track) this.fileListOf = track;
+      if (this.wsTarget === track) this.fileListOf = track;
     }
   }
 
   async loadGit() {
-    const track = this.track;
+    const track = this.wsTarget;
     if (!track) return;
     this.gitLoading = true;
     try {
       const git = await invoke<WsGit>("workspace_git_status", { track });
-      if (this.track === track) {
+      if (this.wsTarget === track) {
         this.git = git;
         if (this.diffPath && !git.changes.some((c) => c.path === this.diffPath)) this.diffPath = "";
       }
@@ -1515,24 +1642,24 @@ class Store {
 
   /** Show one change's diff in the changes tab. */
   async loadDiff(path: string) {
-    const track = this.track;
+    const track = this.wsTarget;
     const change = this.git?.changes.find((c) => c.path === path);
     if (!track || !change) return;
     this.diffPath = path;
     try {
       const text = await invoke<string>("workspace_git_diff", { track, path, untracked: change.untracked });
-      if (this.track === track) this.diffs = { ...this.diffs, [path]: text };
+      if (this.wsTarget === track) this.diffs = { ...this.diffs, [path]: text };
     } catch (err) {
       this.lastError = String(err);
     }
   }
 
   private async loadFile(path: string) {
-    const track = this.track;
+    const track = this.wsTarget;
     if (!track) return;
     try {
       const file = await invoke<WsFile>("workspace_read", { track, path });
-      if (this.track === track) this.files = { ...this.files, [path]: file };
+      if (this.wsTarget === track) this.files = { ...this.files, [path]: file };
     } catch (err) {
       this.lastError = String(err);
     }
@@ -1556,7 +1683,7 @@ class Store {
   }
 
   private draftKey(path: string): string {
-    return `${this.track}\0${path}`;
+    return `${this.wsTarget}\0${path}`;
   }
 
   /**
@@ -1599,7 +1726,7 @@ class Store {
    * `force`.
    */
   async saveFile(path: string, force = false) {
-    const track = this.track;
+    const track = this.wsTarget;
     const key = this.draftKey(path);
     const draft = this.drafts[key];
     if (!track || !draft || this.saving[key]) return;
@@ -1612,7 +1739,7 @@ class Store {
       this.drafts = now && now.text !== draft.text ? { ...rest, [key]: { text: now.text, base: file.text ?? "" } } : rest;
       const { [key]: _c, ...conflicts } = this.saveConflicts;
       this.saveConflicts = conflicts;
-      if (this.track === track) {
+      if (this.wsTarget === track) {
         this.files = { ...this.files, [path]: file };
         void this.loadGit();
       }
@@ -1661,9 +1788,9 @@ class Store {
 
   /** Select a file in the system file manager. */
   async revealFile(path: string) {
-    if (!this.track) return;
+    if (!this.wsTarget) return;
     try {
-      await invoke("workspace_reveal", { track: this.track, path });
+      await invoke("workspace_reveal", { track: this.wsTarget, path });
     } catch (err) {
       this.lastError = String(err);
     }
@@ -1979,6 +2106,9 @@ class Store {
     for (const d of this.artifacts) {
       if (d.tags.includes(name)) await this.updateArtifact(d.id, { tags: d.tags.filter((x) => x !== name) });
     }
+    for (const r of this.routines) {
+      if (r.tags?.includes(name)) await this.saveRoutine(r.id, { tags: r.tags.filter((x) => x !== name) });
+    }
     for (const holder of this.tagHolders) await holder(name);
   }
   // ----- errors the human should see, wherever they happened -----
@@ -2155,6 +2285,7 @@ class Store {
   /** The artifact whose conversation is on screen, else the open design. */
   get currentArtifact(): ArtifactInfo | undefined {
     const id = this.chatArtifactId || this.artifact;
+    if (this.planInfo && this.planInfo.id === id) return this.planInfo;
     return this.artifacts.find((d) => d.id === id);
   }
 
@@ -2217,6 +2348,7 @@ class Store {
   }
 
   async openRoutine(id: string) {
+    if (this.routine !== id) this.routineRunsLimit = RUNS_PAGE;
     this.routine = id;
     this.view = "routines";
     await this.loadRoutineRuns(id);
@@ -2229,16 +2361,33 @@ class Store {
     this.view = "routines";
   }
 
+  /** How many of the open routine's runs are read: a page more each time the history asks. */
+  routineRunsLimit = $state(RUNS_PAGE);
+  /** The latest history read asked for: an answer to an older one is let go. */
+  private runsAsked = 0;
+
   async loadRoutineRuns(id = this.routine) {
+    const asked = ++this.runsAsked;
     if (!id || id === NEW_ROUTINE) {
       this.routineRuns = [];
       return;
     }
     try {
-      this.routineRuns = await invoke<RoutineRun[]>("routine_runs", { id, limit: 50 });
+      const runs = await invoke<RoutineRun[]>("routine_runs", { id, limit: this.routineRunsLimit });
+      // Another routine opened, or a newer read went out, while this one was on its way.
+      if (asked !== this.runsAsked || this.routine !== id) return;
+      this.routineRuns = runs;
     } catch (err) {
       this.lastError = String(err);
     }
+  }
+
+  /** Read the next page of the open routine's runs, when there may be more. */
+  async loadMoreRoutineRuns() {
+    const next = nextRunsLimit(this.routineRuns.length, this.routineRunsLimit);
+    if (next === null) return;
+    this.routineRunsLimit = next;
+    await this.loadRoutineRuns();
   }
 
   routineLive(id: string): boolean {
@@ -2252,16 +2401,43 @@ class Store {
     notifyRoutine(done.routine, done.run, done.status, `${done.name} — ${how}`, done.summary);
   }
 
-  async runRoutine(id: string) {
+  /** Told the moment a routine is run, before the core answers (the plan shows its first wave). */
+  routineStarted: ((id: string) => void)[] = [];
+  /** Told when a run that was shown as started did not start after all. */
+  routineFailed: ((id: string) => void)[] = [];
+  /** Routines with a Run on its way to the core: a second press waits for the first. */
+  routineAsking = $state<string[]>([]);
+
+  /** Whether a Run of this routine is on its way (its buttons are off meanwhile). */
+  routineRequesting(id: string): boolean {
+    return this.routineAsking.includes(id);
+  }
+
+  /** Run a routine; true when the core started it. One request at a time per routine. */
+  async runRoutine(id: string): Promise<boolean> {
+    if (this.routineAsking.includes(id) || this.routineRunning.includes(id)) return false;
+    this.routineAsking = [...this.routineAsking, id];
     // Shown as running at once: the core is asked next, and its answer is
     // what keeps it that way.
-    if (!this.routineRunning.includes(id)) this.routineRunning = [...this.routineRunning, id];
+    this.routineRunning = [...this.routineRunning, id];
+    for (const told of this.routineStarted) told(id);
     try {
       await invoke("run_routine", { id });
       await this.loadRoutineRuns(id);
+      return true;
     } catch (err) {
       this.lastError = String(err);
-      this.routineRunning = this.routineRunning.filter((r) => r !== id);
+      // Not started by this press: what the core says is running stands (a
+      // run from the phone or the conductor may be), else it is off the list.
+      try {
+        this.routineRunning = await invoke<string[]>("running_routines");
+      } catch {
+        this.routineRunning = this.routineRunning.filter((r) => r !== id);
+      }
+      for (const told of this.routineFailed) told(id);
+      return false;
+    } finally {
+      this.routineAsking = this.routineAsking.filter((r) => r !== id);
     }
   }
 
@@ -2288,7 +2464,7 @@ class Store {
 
   async saveRoutine(
     id: string,
-    patch: { name?: string; instruction?: string; cwd?: string; agent?: string; config?: OptionConfig },
+    patch: { name?: string; instruction?: string; cwd?: string; agent?: string; config?: OptionConfig; color?: string; tags?: string[] },
   ) {
     try {
       await invoke<Routine>("update_routine", { id, patch });
@@ -2300,17 +2476,19 @@ class Store {
     }
   }
 
-  async deleteRoutine(id: string) {
+  /** Delete a routine; its error, or "" when it went. */
+  async deleteRoutine(id: string): Promise<string> {
     try {
       await invoke("delete_routine", { id });
     } catch (err) {
       this.lastError = String(err);
-      return;
+      return this.lastError;
     }
     if (this.routine === id) this.routine = "";
     await this.loadRoutines();
     if (this.routines.length) await this.openRoutine(this.routines[0].id);
     else this.newRoutine();
+    return "";
   }
 
   /** Show the designs: the last one open, else the newest. */
@@ -2421,6 +2599,8 @@ class Store {
     try {
       const d = await invoke<ArtifactInfo>("update_artifact", { id, ...patch });
       this.artifacts = this.artifacts.map((x) => (x.id === id ? d : x));
+      // The plan on screen is not in that list (see planInfo).
+      if (this.planInfo?.id === id) this.planInfo = d;
     } catch (err) {
       this.lastError = String(err);
     }
@@ -2752,6 +2932,7 @@ class Store {
     this.view = "track";
     if (changed) {
       this.clearWorkspace();
+      this.wsLoaded = id;
       if (this.panelOpen) void this.refreshWorkspace();
       void this.refreshConductor();
       void this.refreshWorkerSessions();
@@ -3198,7 +3379,7 @@ class Store {
         this.lastError = String(err);
       }
       try {
-        const [term, termHeight, artifactChat, designList, designListWidth, settingsNavWidth, routineList, routineListWidth, designChat, kbList, kbListWidth, kbLibrary, designTags, kbTags] = await Promise.all([
+        const [term, termHeight, artifactChat, designList, designListWidth, settingsNavWidth, routineList, routineListWidth, designChat, kbList, kbListWidth, kbLibrary, designTags, kbTags, routineTags] = await Promise.all([
           setting("terminal"),
           setting("terminal_height"),
           setting("artifact_chat_width"),
@@ -3213,6 +3394,7 @@ class Store {
           setting("kblibrary"),
           setting("designlist_tags"),
           setting("kblist_tags"),
+          setting(ROUTINE_TAGS_KEY),
         ]);
         const dc = Number(artifactChat);
         if (Number.isFinite(dc) && dc > 0) this.setArtifactChatWidth(dc);
@@ -3226,12 +3408,14 @@ class Store {
         if (!overWeb) this.designListOpen = settingOpen(designList);
         if (!overWeb) this.routineListOpen = settingOpen(routineList);
         this.designChatOpen = designChat !== "closed";
+        void this.restoreSides();
         if (!overWeb) this.kbListOpen = settingOpen(kbList);
         const kw = Number(kbListWidth);
         if (Number.isFinite(kw) && kw > 0) this.setKbListWidth(kw);
         this.kbLibrarySaved = kbLibrary ?? "";
         this.designTags = parseTags(designTags);
         this.kbTags = parseTags(kbTags);
+        this.routineTags = parseTags(routineTags);
         const h = Number(termHeight);
         if (Number.isFinite(h) && h > 0) this.setTermHeight(h);
         if (term === "open") void this.setTerminal(true);
@@ -3592,6 +3776,27 @@ class Store {
     } catch (err) {
       // Same reasoning as the pump's catch, for the path that never
       // reached the line: the composer is already empty by now.
+      this.setQueued(pushQueued(this.queued, { ...out, held: true }));
+      this.raise(String(err));
+    }
+  }
+
+  /**
+   * A message to an artifact's agent whose panel may not be open (a
+   * routine's first plan draft). It joins that conversation's line as a
+   * typed one would, and is kept in its history.
+   */
+  async sendToArtifact(id: string, agent: string, text: string) {
+    const key = artifactKey(id);
+    const out: Queued = { id: `q${++this.queueSeq}-${Date.now()}`, key, target: id, agent, text, files: [], picks: [], selected: [], at: Date.now() };
+    if (this.busyFor(key) || liveQueuedFor(this.queued, key).length) {
+      this.setQueued(pushQueued(this.queued, out));
+      this.startPump();
+      return;
+    }
+    try {
+      await this.dispatch(out);
+    } catch (err) {
       this.setQueued(pushQueued(this.queued, { ...out, held: true }));
       this.raise(String(err));
     }

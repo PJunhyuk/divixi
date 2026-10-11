@@ -26,6 +26,8 @@ pub const EVENTS: &[&str] = &[
     "parked",
     "routines",
     "routine_done",
+    "routine_progress",
+    "plan",
     "knowledge",
     "knowledge-removed",
     "knowledge-embedding",

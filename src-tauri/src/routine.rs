@@ -57,6 +57,84 @@ struct Live {
     /// The run it is writing into.
     run: String,
     session: Arc<AgentSession>,
+    /// The plan it was given (its saved version), when it was given one.
+    plan: Option<Value>,
+    /// What its agent said so far of each step, through `plan_step`.
+    progress: Progress,
+}
+
+/// Each step's latest word from a run's agent: `started`, `done`, `failed`
+/// or `skipped`, and a short note.
+type Progress = Arc<parking_lot::Mutex<std::collections::BTreeMap<String, (String, String)>>>;
+
+/// What the window hears as a run's agent says where it is in its plan.
+#[derive(Clone, serde::Serialize)]
+pub struct StepProgress {
+    pub routine: String,
+    pub run: String,
+    pub step: String,
+    pub status: String,
+    pub note: String,
+}
+
+/// The run of a routine in flight, as the plan on screen shows it: the run,
+/// the plan it was given, and where its agent said it is. None when the
+/// routine is not running.
+pub async fn live(app: &AppHandle, id: &str) -> Option<Value> {
+    let state = app.state::<AppState>();
+    let live = state.routines.live.lock().await;
+    let l = live.get(id)?;
+    let progress: serde_json::Map<String, Value> =
+        l.progress.lock().iter().map(|(k, (status, note))| (k.clone(), json!({ "status": status, "note": note }))).collect();
+    Some(json!({ "run": l.run, "plan": l.plan, "progress": progress }))
+}
+
+/// The one tool a run given a plan has: saying a step has started, and how
+/// it ended. That is what the plan on screen shows while the run goes; the
+/// report at the end still has the last word.
+fn step_tool(app: AppHandle, routine: String, run: String, ids: Vec<String>, progress: Progress) -> orchestra_mcp::Tool {
+    orchestra_mcp::Tool::new(
+        crate::plan::PLAN_STEP,
+        "Say where you are in the plan: call it with status \"started\" as you begin a step, and \"done\", \"failed\" or \"skipped\" when it ends. The human watches the plan move with these.",
+        json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "The step's id, as in the plan (s1, s2...)." },
+                "status": { "type": "string", "enum": ["started", "done", "failed", "skipped"] },
+                "note": { "type": "string", "description": "One short line, optional." }
+            },
+            "required": ["id", "status"],
+            "additionalProperties": false
+        }),
+        move |args| {
+            let (app, routine, run, ids, progress) = (app.clone(), routine.clone(), run.clone(), ids.clone(), progress.clone());
+            async move {
+                let step = args.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+                let status = args.get("status").and_then(Value::as_str).unwrap_or_default().to_string();
+                if !ids.contains(&step) {
+                    return Err(format!("no step {step} in this plan; the steps are {}", ids.join(", ")));
+                }
+                if !matches!(status.as_str(), "started" | "done" | "failed" | "skipped") {
+                    return Err("status is started, done, failed or skipped".to_string());
+                }
+                let note: String = args.get("note").and_then(Value::as_str).unwrap_or_default().chars().take(300).collect();
+                progress.lock().insert(step.clone(), (status.clone(), note.clone()));
+                let _ = app.emit("routine_progress", StepProgress { routine, run, step, status, note });
+                Ok(json!({ "ok": true }))
+            }
+        },
+    )
+}
+
+/// Step results from what the agent said through `plan_step`, for a run
+/// whose report left none: the steps that ended, in plan order.
+fn results_from(progress: &Progress, ids: &[String]) -> Option<Value> {
+    let p = progress.lock();
+    let out: Vec<Value> = ids
+        .iter()
+        .filter_map(|id| p.get(id).filter(|(s, _)| s != "started").map(|(s, n)| json!({ "id": id, "status": s, "note": n })))
+        .collect();
+    (!out.is_empty()).then(|| Value::Array(out))
 }
 
 /// Every routine with a turn in flight, by routine id.
@@ -68,16 +146,29 @@ struct Live {
 #[derive(Default)]
 pub struct Routines {
     live: Mutex<HashMap<String, Live>>,
+    /// Routines claimed by a run that is still opening its agent: between
+    /// the check and the `live` entry there are awaits, and a second Run
+    /// (the phone's, the conductor's, a double press) must not slip in.
+    starting: parking_lot::Mutex<HashSet<String>>,
     /// Runs a person stopped by hand, so the record says `stopped` and not
     /// `done`. Read once, when the run closes.
     stopped: parking_lot::Mutex<HashSet<String>>,
 }
 
 impl Routines {
-    /// The routines running right now.
+    /// The routines running right now, those still opening their agent too.
     pub async fn running(&self) -> Vec<String> {
-        self.live.lock().await.keys().cloned().collect()
+        let live = self.live.lock().await;
+        let mut out: Vec<String> = live.keys().cloned().collect();
+        out.extend(self.starting.lock().iter().filter(|id| !live.contains_key(*id)).cloned());
+        out
     }
+}
+
+/// Claim a routine for a run about to start: false when it is running, or
+/// another run is already starting it.
+fn claim(starting: &mut HashSet<String>, running: bool, id: &str) -> bool {
+    !running && starting.insert(id.to_string())
 }
 
 /// What a finished run tells the window, so the bell can say so.
@@ -102,12 +193,19 @@ pub async fn run(app: AppHandle, id: &str) -> Result<Value, String> {
     };
 
     // Said in the routine's own words. Nothing here can refuse for a
-    // worker's reasons, because there is no worker to be busy.
-    if app.state::<AppState>().routines.live.lock().await.contains_key(&r.id) {
-        return Err(format!("'{}' is already running. Wait for it to finish.", r.name));
+    // worker's reasons, because there is no worker to be busy. The check and
+    // the claim are one step, under the lock the running list is read under.
+    {
+        let state = app.state::<AppState>();
+        let live = state.routines.live.lock().await;
+        if !claim(&mut state.routines.starting.lock(), live.contains_key(&r.id), &r.id) {
+            return Err(format!("'{}' is already running. Wait for it to finish.", r.name));
+        }
     }
 
     let outcome = start(app.clone(), &r).await;
+    // Started (it is in `live` now) or not: the claim is done either way.
+    app.state::<AppState>().routines.starting.lock().remove(&r.id);
     let _ = notify(&app);
     outcome
 }
@@ -116,25 +214,61 @@ pub async fn run(app: AppHandle, id: &str) -> Result<Value, String> {
 async fn start(app: AppHandle, r: &Routine) -> Result<Value, String> {
     let state = app.state::<AppState>();
     let spec = state.spec_for(&r.agent)?;
-    // No MCP server: a routine has no divixi tools to offer. It does work in
-    // a folder and says what it did.
-    let opts = session_options(&state, &r.agent, &r.cwd, &r.config, None);
-    // Deliberately no `opts.resume`: see the module note. Each run is new.
-    tracing::info!(routine = %r.id, agent = %r.agent, cwd = %r.cwd, "opening routine session");
-    let session = Arc::new(AgentSession::open(&spec, opts).await.map_err(|e| e.to_string())?);
 
+    // Its plan, when it has a saved version: the last one, given in the same
+    // prompt and kept with the run.
+    let guided = guidance(&state, r);
+    let ids: Vec<String> = guided.as_ref().map(|g| g.ids.clone()).unwrap_or_default();
+    let progress: Progress = Default::default();
+    // The run's id comes before the session, so the plan's one tool can name
+    // it; a session that does not open leaves the run failed, as any other.
     let run = state
         .store
         .begin_routine_run(&r.id, &r.agent, &r.cwd, &r.instruction)
         .map_err(|e| e.to_string())?;
 
-    // Held for the turn: what the human answers and stops.
-    state
-        .routines
-        .live
-        .lock()
-        .await
-        .insert(r.id.clone(), Live { run: run.clone(), session: session.clone() });
+    // A run without a plan has no divixi tools: it does work in a folder and
+    // says what it did. A run given a plan has one, `plan_step`, to say
+    // where it is in it.
+    let mcp = match &guided {
+        Some(_) => {
+            let tool = step_tool(app.clone(), r.id.clone(), run.clone(), ids.clone(), progress.clone());
+            match orchestra_mcp::McpServer::start("divixi", vec![tool]).await {
+                Ok(server) => Some(server),
+                Err(err) => {
+                    tracing::warn!(%err, routine = %r.id, "running without step progress: its tool did not start");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    let opts = session_options(&state, &r.agent, &r.cwd, &r.config, mcp.as_ref());
+    // Deliberately no `opts.resume`: see the module note. Each run is new.
+    tracing::info!(routine = %r.id, agent = %r.agent, cwd = %r.cwd, "opening routine session");
+    let session = match AgentSession::open(&spec, opts).await {
+        Ok(s) => Arc::new(s),
+        Err(err) => {
+            let why = err.to_string();
+            let _ = state.store.end_routine_run(&run, RoutineStatus::Failed, "", &why, 0, None);
+            return Err(why);
+        }
+    };
+
+    if let Some(g) = &guided {
+        if let Err(err) = state.store.set_routine_run_plan(&run, &g.snapshot) {
+            tracing::warn!(%err, %run, "could not keep the plan a routine run was given");
+        }
+    }
+
+    // Held for the turn: what the human answers and stops, and where the plan is.
+    state.routines.live.lock().await.insert(
+        r.id.clone(),
+        Live { run: run.clone(), session: session.clone(), plan: guided.as_ref().map(|g| g.snapshot.clone()), progress: progress.clone() },
+    );
+    if guided.is_some() {
+        let _ = app.emit("routine_progress", StepProgress { routine: r.id.clone(), run: run.clone(), step: String::new(), status: "begun".into(), note: String::new() });
+    }
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     // The routine's own event reader. Not `pump`: that writes a run row and
@@ -143,18 +277,26 @@ async fn start(app: AppHandle, r: &Routine) -> Result<Value, String> {
 
     // The report rules are the same ones a worker is given: they describe
     // the block, not the worker.
-    let sent = format!("{}\n\n---\n{}", r.instruction, report::instructions());
+    let sent = prompt(&r.instruction, guided.as_ref().map(|g| g.section.as_str()));
 
     let (app_t, id_t, run_t, name_t) = (app.clone(), r.id.clone(), run.clone(), r.name.clone());
     tauri::async_runtime::spawn(async move {
         let failed = session.prompt_with(sent, Vec::new(), tx.clone()).await.err().map(|e| e.to_string());
         drop(tx); // ends the collector
-        // Let go here: the session lives for the turn and no longer.
+        // Let go here: the session lives for the turn and no longer, and
+        // the plan's tool with it.
         drop(session);
+        drop(mcp);
 
         let (text, tools) = collector.await.unwrap_or_default();
         let st = app_t.state::<AppState>();
-        st.routines.live.lock().await.remove(&id_t);
+        {
+            // This run's entry only: never another run's of the same routine.
+            let mut live = st.routines.live.lock().await;
+            if live.get(&id_t).is_some_and(|l| l.run == run_t) {
+                live.remove(&id_t);
+            }
+        }
         let stopped = st.routines.stopped.lock().remove(&run_t);
 
         let status = match (&failed, stopped) {
@@ -170,6 +312,21 @@ async fn start(app: AppHandle, r: &Routine) -> Result<Value, String> {
         // not do, and a made-up "partial" would read as a finding.
         let report = (status == RoutineStatus::Done).then(|| checked(&text));
         let as_json = report.as_ref().and_then(|r| serde_json::to_value(r).ok());
+        // What the agent said of each step. A run that finished by itself:
+        // its report's list, else what it said step by step. One that failed
+        // or was stopped: what it said step by step, which is where it broke.
+        if !ids.is_empty() {
+            let steps = if status == RoutineStatus::Done {
+                crate::plan::step_results(&text, &ids).or_else(|| results_from(&progress, &ids))
+            } else {
+                results_from(&progress, &ids)
+            };
+            if let Some(steps) = steps {
+                if let Err(err) = st.store.set_routine_run_steps(&run_t, &steps) {
+                    tracing::warn!(%err, run = %run_t, "could not keep a routine run's step results");
+                }
+            }
+        }
         if let Err(err) = st.store.end_routine_run(
             &run_t,
             status,
@@ -195,6 +352,57 @@ async fn start(app: AppHandle, r: &Routine) -> Result<Value, String> {
     });
 
     Ok(json!({ "routine": r.id, "run": run, "agent": r.agent, "cwd": r.cwd, "status": "running" }))
+}
+
+/// What a routine's session is sent: its instruction, its plan when it is
+/// given one, and the report rules. Without a plan it is exactly what it
+/// always was.
+fn prompt(instruction: &str, plan: Option<&str>) -> String {
+    match plan {
+        None => format!("{}\n\n---\n{}", instruction, report::instructions()),
+        Some(plan) => format!("{}\n\n---\n{}\n\n---\n{}", instruction, plan, report::instructions()),
+    }
+}
+
+/// Why the conductor may not run this routine now (see
+/// `plan::run_refusal`), in the conductor's own language. A plan that
+/// cannot be read is a refusal too: the run would go without the plan the
+/// human sees.
+pub fn refusal(app: &AppHandle, id: &str) -> Option<String> {
+    let state = app.state::<AppState>();
+    let r = state.store.routine(id).ok().flatten()?;
+    if r.plan.is_empty() {
+        return None;
+    }
+    let pref = state.store.get_meta(&format!("{}language", crate::SETTING_PREFIX)).ok().flatten();
+    let ko = korean(pref.as_deref());
+    match crate::plan::doc(&state, &r.plan) {
+        Ok(doc) => crate::plan::run_refusal(&doc, ko),
+        Err(err) if ko => Some(format!("계획을 읽지 못해 실행하지 않았습니다: {err}")),
+        Err(err) => Some(format!("The plan could not be read, so it did not run: {err}")),
+    }
+}
+
+/// Whether the conductor speaks Korean, as it decides it (conductor.rs):
+/// everything but English chosen outright, "system" included.
+fn korean(pref: Option<&str>) -> bool {
+    pref != Some("en")
+}
+
+/// The plan a run is given, if its routine has one to give. A plan that
+/// cannot be read is said in the log and the run goes on without it: the
+/// instruction alone is still the routine.
+fn guidance(state: &AppState, r: &Routine) -> Option<crate::plan::Guidance> {
+    if r.plan.is_empty() {
+        return None;
+    }
+    match crate::plan::doc(state, &r.plan) {
+        Ok(doc) => crate::plan::guidance(&doc),
+        Err(err) => {
+            tracing::warn!(%err, routine = %r.id, plan = %r.plan, "running without the plan: it could not be read");
+            None
+        }
+    }
 }
 
 /// Read the turn's events for the two things a routine's history keeps: what
@@ -284,4 +492,57 @@ pub async fn cancel(app: &AppHandle, id: &str) {
 /// Tell the window a routine's list has moved.
 pub fn notify(app: &AppHandle) -> Result<(), String> {
     app.emit("routines", ()).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_refusal_speaks_the_conductors_language() {
+        assert!(korean(Some("ko")));
+        assert!(!korean(Some("en")));
+        assert!(korean(Some("system")), "as the conductor reads it: anything but English is Korean");
+        assert!(korean(None));
+    }
+
+    #[test]
+    fn a_routine_is_claimed_once_while_it_starts() {
+        let mut starting = HashSet::new();
+        assert!(claim(&mut starting, false, "ro1"));
+        assert!(!claim(&mut starting, false, "ro1"), "a second Run while the first opens its agent");
+        assert!(claim(&mut starting, false, "ro2"), "another routine is its own");
+        starting.remove("ro1");
+        assert!(!claim(&mut starting, true, "ro1"), "running already");
+        assert!(claim(&mut starting, false, "ro1"), "free again once it ended");
+    }
+
+    use super::*;
+
+    /// A routine without a plan is sent what it always was, to the byte.
+    #[test]
+    fn without_a_plan_the_prompt_is_as_before() {
+        let before = format!("{}\n\n---\n{}", "list the stale dependencies", report::instructions());
+        assert_eq!(prompt("list the stale dependencies", None), before);
+    }
+
+    #[test]
+    fn with_a_plan_it_sits_between_the_instruction_and_the_report_rules() {
+        let sent = prompt("check deps", Some("[plan] Wave 1"));
+        let (i, p, r) = (sent.find("check deps").unwrap(), sent.find("[plan]").unwrap(), sent.find(report::FENCE).unwrap());
+        assert!(i < p && p < r, "{sent}");
+    }
+
+    #[test]
+    fn step_results_fall_back_to_what_the_agent_said_step_by_step() {
+        let progress: Progress = Default::default();
+        let ids: Vec<String> = ["s1", "s2", "s3"].iter().map(|s| s.to_string()).collect();
+        assert!(results_from(&progress, &ids).is_none(), "nothing said, nothing kept");
+        progress.lock().insert("s2".into(), ("failed".into(), "no network".into()));
+        progress.lock().insert("s1".into(), ("done".into(), String::new()));
+        progress.lock().insert("s3".into(), ("started".into(), String::new()));
+        assert_eq!(
+            results_from(&progress, &ids).unwrap(),
+            json!([{ "id": "s1", "status": "done", "note": "" }, { "id": "s2", "status": "failed", "note": "no network" }]),
+            "in plan order, and a step only started has no result"
+        );
+    }
 }

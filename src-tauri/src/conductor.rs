@@ -866,6 +866,7 @@ The folder defaults to this track's and the agent to the one workers here use; s
                             cwd: Some(folder),
                             agent: Some(agent),
                             config: None,
+                            ..Default::default()
                         })
                         .map_err(|e| e.to_string())?;
                     let _ = crate::routine::notify(&app);
@@ -910,7 +911,7 @@ The folder defaults to this track's and the agent to the one workers here use; s
         ),
         Tool::new(
             "run_routine",
-            "Run a saved routine now. Returns at once with the run id. It runs on its own agent in its own folder, on a session of its own that ends with the run — it is not a worker, and there is nothing of it to follow up with. What it found is NOT sent to you: the human is told on the bell and reads it on the Routines page. Say you started it and end your turn.",
+            "Run a saved routine now. Returns at once with the run id. It runs on its own agent in its own folder, on a session of its own that ends with the run — it is not a worker, and there is nothing of it to follow up with. What it found is NOT sent to you: the human is told on the bell and reads it on the Routines page. Say you started it and end your turn. A routine whose plan is not saved (or changed since it was) is refused: pass the refusal's words on to the human as they are, and do not retry.",
             json!({
                 "type": "object",
                 "properties": { "routine": { "type": "string", "description": "Routine id from list_routines." } },
@@ -920,6 +921,12 @@ The folder defaults to this track's and the agent to the one workers here use; s
                 let app = run_routine.clone();
                 async move {
                     let id = str_arg(&args, "routine")?;
+                    // No one is there to ask "save the plan first?", as the
+                    // Routines page asks: a plan on screen that the run would
+                    // not get is refused, in words to pass on.
+                    if let Some(why) = crate::routine::refusal(&app, &id) {
+                        return Err(why);
+                    }
                     crate::routine::run(app, &id).await
                 }
             },
@@ -1000,6 +1007,24 @@ pub fn route_permission(app: &AppHandle, track: &str, session: &str, run: &str, 
         return;
     };
     let state = app.state::<AppState>();
+    // A plan's agent asks for everything it would do (see artifact::open):
+    // its own plan tools are let through, anything else (a file written, a
+    // command run) is refused, without asking the human either way.
+    if let Some(id) = track.strip_prefix("artifact:") {
+        if state.store.artifact(id).ok().flatten().is_some_and(|(a, _)| a.kind == crate::plan::KIND) {
+            let allow = crate::plan::is_own_tool(title, input);
+            let kinds: &[&str] = if allow { &["allow_always", "allow_once"] } else { &["reject_once", "reject_always"] };
+            let option = kinds.iter().find_map(|k| options.iter().find(|o| o.kind == *k)).map(|o| o.id.clone());
+            tracing::info!(plan = %id, %title, %tool_kind, allow, "answered a plan agent's question");
+            let (app, id, request) = (app.clone(), id.to_string(), request.clone());
+            tauri::async_runtime::spawn(async move {
+                if let Err(err) = crate::artifact::answer_permission(&app, &id, &request, option.as_deref()).await {
+                    tracing::warn!(%err, plan = %id, "could not answer a plan agent's question");
+                }
+            });
+            return;
+        }
+    }
     let artifact = track.starts_with("artifact:");
     // A routine has no conductor to decide for the human, so its agent asks
     // them directly — the same way an artifact's does.

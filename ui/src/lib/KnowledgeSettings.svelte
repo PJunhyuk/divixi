@@ -4,6 +4,7 @@
   import { kb } from "./knowledge.svelte";
   import { K_AGENT, K_CONFIG, K_EMBED_DIMS, K_EMBED_ENABLED, K_EMBED_KEY, K_EMBED_MODEL, K_EMBED_RATE, K_EMBED_URL, K_EXTRACT, K_POOL, embedSettable, paneKeys } from "./knowledgeKeys";
   import { t } from "./i18n.svelte";
+  import { missingChoice, shownChoice } from "./agentOptions";
 
   /** The embedding is set on this PC only: from another device it is not shown, read or saved. */
   const embedHere = embedSettable(local);
@@ -211,12 +212,18 @@
         <div class="label sub">{t("kb.set.model")}</div>
         <div class="help">{t("kb.set.modelHelp")}</div>
         <div class="models" role="radiogroup" aria-label={t("kb.set.model")}>
+          {#if missingChoice(modelOption, sConfig[modelOption.id])}
+            <button class="model on" role="radio" aria-checked="true" disabled>
+              <span class="mname">{sConfig[modelOption.id]}</span>
+              <span class="mono dflt">{t("picker.missing")}</span>
+            </button>
+          {/if}
           {#each modelOption.choices as c (c.id)}
-            {@const chosen = (sConfig[modelOption.id] ?? "") === c.id}
+            {@const chosen = shownChoice(modelOption, sConfig[modelOption.id]) === c.id}
             <button class="model" class:on={chosen} role="radio" aria-checked={chosen} disabled={!sExtract} onclick={() => setOption(modelOption.id, c.id)}>
               <span class="mname">{c.name}</span>
               {#if cheap[modelOption.id] === c.id}<span class="mono cheap">{t("kb.set.cheapest")}</span>{/if}
-              {#if c.id === modelOption.current}<span class="mono dflt">{t("kb.set.agentDefault")}</span>{/if}
+              {#if c.id === modelOption.current}<span class="mono dflt">now</span>{/if}
             </button>
           {/each}
         </div>
