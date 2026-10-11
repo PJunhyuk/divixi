@@ -24,7 +24,8 @@
   import { slide } from "svelte/transition";
   import { cubicOut } from "svelte/easing";
   import SplitHandle from "./SplitHandle.svelte";
-  import Icon from "./Icon.svelte";
+  import NewButton from "./NewButton.svelte";
+  import FoldButton from "./FoldButton.svelte";
   import ListSearch from "./ListSearch.svelte";
   import { store } from "./store.svelte";
   import { t } from "./i18n.svelte";
@@ -56,7 +57,6 @@
     onwidth,
     onclose,
     newLabel,
-    newButton,
     newPlaceholder,
     searchPlaceholder,
     maxlength = 80,
@@ -72,7 +72,6 @@
     menued = null,
     onpick,
     onmenu,
-    empty,
   }: {
     title: string;
     width: number;
@@ -82,9 +81,8 @@
     widthLabel: string;
     onwidth: (px: number, persist: boolean) => void;
     onclose: () => void;
+    /** What the "+" makes ("New design"): its name and tooltip, and the box's. */
     newLabel: string;
-    /** The head's button, as the tracks column's "+ TRACK". */
-    newButton: string;
     newPlaceholder: string;
     searchPlaceholder: string;
     maxlength?: number;
@@ -105,7 +103,6 @@
     menued?: string | null;
     onpick: (id: string) => void;
     onmenu: (id: string, x: number, y: number) => void;
-    empty: string;
   } = $props();
 
   /** Slides like the tracks column; not for those who asked for less motion. */
@@ -188,14 +185,13 @@
       <span class="mlab">{title}</span>
       <span class="grow"></span>
       <div class="plus" bind:this={menuEl}>
-        <button
-          class="btn newbtn"
-          class:on={creating || choosing}
-          title={newLabel}
+        <NewButton
+          label={newLabel}
+          on={creating || choosing}
           aria-haspopup={options.length ? "menu" : undefined}
           aria-expanded={options.length ? choosing : creating}
-          onclick={plus}>{newButton}</button
-        >
+          onclick={plus}
+        />
         {#if choosing}
           <div class="newmenu" role="menu" aria-label={newLabel}>
             {#each options as o (o.id)}
@@ -204,9 +200,7 @@
           </div>
         {/if}
       </div>
-      <button class="x" onclick={onclose} aria-label={t("tracks.close")} title={t("tracks.close")}>
-        <Icon name="collapse" />
-      </button>
+      <FoldButton onclick={onclose} />
     </div>
     {#if creating}
       <form class="new" onsubmit={create}>
@@ -279,9 +273,8 @@
           </button>
         </div>
       {/each}
-      {#if !items.length}
-        <div class="mono empty">{empty}</div>
-      {:else if filtering && !shown.length}
+      <!-- An empty list is left empty: the head's "+" is the way to a first one. -->
+      {#if filtering && !shown.length}
         <!-- Nothing the search or filter lets through: said as the tracks column says it. -->
         <div class="mono empty">{t("tracks.none")}</div>
       {/if}
@@ -314,17 +307,6 @@
     gap: 8px;
     padding: 0 10px 0 16px;
     border-bottom: 1px solid var(--line);
-  }
-
-  /* The head's "+", as the tracks column's "+ TRACK". */
-  .newbtn {
-    height: 26px;
-    padding: 0 9px;
-  }
-
-  .newbtn.on {
-    color: var(--hi);
-    border-color: var(--acc);
   }
 
   /* The "+" and, with options, its menu under it. */
@@ -373,22 +355,6 @@
 
   .grow {
     flex: 1;
-  }
-
-  .x {
-    width: 28px;
-    height: 28px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: transparent;
-    border: 0;
-    color: var(--lab);
-  }
-
-  .x:hover {
-    color: var(--hi);
-    background: var(--sel);
   }
 
   .new {

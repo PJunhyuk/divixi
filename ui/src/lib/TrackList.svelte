@@ -1,6 +1,7 @@
 <script lang="ts">
   import { store, agentLabel, TRACK_COLORS, type TrackSort } from "./store.svelte";
-  import Icon from "./Icon.svelte";
+  import NewButton from "./NewButton.svelte";
+  import FoldButton from "./FoldButton.svelte";
   import SplitHandle from "./SplitHandle.svelte";
   import ListSearch from "./ListSearch.svelte";
   import { t } from "./i18n.svelte";
@@ -312,10 +313,8 @@
   <div class="head">
     <span class="mlab">{t("tracks.title")}</span>
     <span class="grow"></span>
-    <button class="btn new" class:on={store.view === "new-track"} title={t("tracks.newTitle")} onclick={() => (store.view = "new-track")}>{t("tracks.new")}</button>
-    <button class="x" onclick={() => store.setTrackList(false)} aria-label={t("tracks.close")} title={t("tracks.close")}>
-      <Icon name="collapse" />
-    </button>
+    <NewButton label={t("tracks.newTitle")} on={store.view === "new-track"} onclick={() => (store.view = "new-track")} />
+    <FoldButton onclick={() => store.setTrackList(false)} />
   </div>
 
   <!-- The search row and filter menu the designs and libraries columns use too;
@@ -588,32 +587,6 @@
 
   .grow {
     flex: 1;
-  }
-
-  .new {
-    height: 26px;
-    padding: 0 9px;
-  }
-
-  .new.on {
-    color: var(--hi);
-    border-color: var(--acc);
-  }
-
-  .x {
-    width: 28px;
-    height: 28px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: transparent;
-    border: 0;
-    color: var(--lab);
-  }
-
-  .x:hover {
-    color: var(--hi);
-    background: var(--sel);
   }
 
   .dormant {
