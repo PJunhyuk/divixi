@@ -10,6 +10,8 @@
   import { t } from "./i18n.svelte";
   import { untrack } from "svelte";
   import { FOLLOWING, followed, reached, resized, scrolled, type Stick } from "./scroll";
+  import { REVEAL_DECISION } from "./history";
+  import { createPager } from "./pager.svelte";
 
   // ----- sticking to the bottom -----
   //
@@ -17,7 +19,8 @@
   // in scroll.ts. The rule is the one people expect of a conversation:
   // while the view is at the bottom it follows whatever arrives, and the
   // moment it is scrolled up it holds still. Nothing else in this file
-  // touches scrollTop.
+  // touches scrollTop, bar the one place that keeps the turn being read in
+  // place while an older page lands above it (pager.svelte.ts).
   //
   // What moves the content is watched with a ResizeObserver rather than by
   // listing reactive dependencies: streamed text, a tool line, a decision
@@ -57,12 +60,38 @@
    * touch the wheel. There is nothing to read between here and the foot.
    */
   function toBottom() {
-    follow();
+    // Off a notice's window, the newest page is drawn first, then followed.
+    if (pager.bounded) void pager.toFoot().then(follow);
+    else follow();
   }
 
   function onScroll() {
     if (scroller) stick = scrolled(stick, scroller);
+    pager.check();
   }
+
+  // Older and newer pages are drawn as the human reads toward either edge,
+  // and the view keeps its place while one lands (pager.svelte.ts).
+  const pager = createPager({
+    scroller: () => scroller,
+    content: () => content,
+    key: () => store.chatKey,
+    total: () => conductorRuns.length,
+    stuck: () => stick.stuck,
+    unstick: () => (stick = { ...stick, stuck: false, missed: false }),
+  });
+
+  // A notice about a decision asks for its card: when the turn that asked is
+  // outside the window, the window reaches it (the notice retries until the
+  // card is drawn).
+  $effect(() => {
+    const show = (e: Event) => {
+      const id = (e as CustomEvent<number>).detail;
+      pager.reveal(conductorRuns.findIndex((r) => decisionsByRun.byRun[r.id]?.some((d) => d.id === id)));
+    };
+    document.addEventListener(REVEAL_DECISION, show);
+    return () => document.removeEventListener(REVEAL_DECISION, show);
+  });
 
   // The human reaching back is read from their own input, not inferred from
   // the scroll event it causes: a scroll event cannot say who moved the view,
@@ -77,10 +106,13 @@
     if (!box) return;
     const pull = () => {
       stick = reached(stick, box, true);
+      // Already at the top, a wheel moves nothing and fires no scroll event.
+      pager.check();
     };
 
     const wheel = (e: WheelEvent) => {
       if (e.deltaY < 0) pull();
+      else pager.check();
     };
     const keys = (e: KeyboardEvent) => {
       if (e.key === "PageUp" || e.key === "ArrowUp" || e.key === "Home") pull();
@@ -93,6 +125,7 @@
     const move = (e: TouchEvent) => {
       const y = e.touches[0]?.clientY ?? touchY;
       if (y > touchY) pull();
+      else pager.check();
       touchY = y;
     };
 
@@ -116,10 +149,9 @@
     const inner = content;
     const box = scroller;
     if (!inner || !box) return;
-    let tall = inner.offsetHeight;
+    pager.settle();
     const observer = new ResizeObserver(() => {
-      const grew = inner.offsetHeight > tall;
-      tall = inner.offsetHeight;
+      const grew = pager.grew();
       const { next, follow: chase } = resized(stick, grew);
       stick = next;
       if (chase) follow();
@@ -191,6 +223,8 @@
    *  by a run no longer here) go at the end. */
   /** The human and the conductor, or the human and an artifact's agent. */
   const conductorRuns = $derived(store.chatRuns);
+  /** The turns drawn: a page of them, see the pager. */
+  const shownRuns = $derived(conductorRuns.slice(pager.first, pager.end));
   /** The newest report turn of each worker: its card carries the unmerged changes. */
   const latestReport = $derived.by(() => {
     const out: Record<string, string> = {};
@@ -275,7 +309,10 @@
 
       <!-- The track is the human and the conductor. Worker work is the conductor's
            to relay; workers themselves are read in their own view. -->
-      {#each conductorRuns as run (run.id)}
+      {#if pager.first > 0}
+        <button class="earlier mono" type="button" onclick={() => pager.earlier()}>{t("timeline.earlier", { n: pager.first })}</button>
+      {/if}
+      {#each shownRuns as run (run.id)}
         {#if run.prompt.startsWith(REPORT_PREFIX)}
           {@const head = run.prompt.split("\n")[0]}
           {@const workerRun = /\brun=(\S+)/.exec(head)?.[1] ?? ""}
@@ -442,7 +479,7 @@
     </div>
   </div>
 
-  {#if stick.missed}
+  {#if stick.missed || pager.bounded}
     <!-- Reading back while the agent answered: the way down, and back to
          following it. -->
     <button class="jump mono" type="button" onclick={() => toBottom()}>
@@ -509,6 +546,25 @@
   .jarrow {
     font-size: 12px;
     color: var(--acc);
+  }
+
+  /* Older turns not drawn yet: a line at the top that asks for the next page. */
+  .earlier {
+    display: block;
+    margin: 0 auto 18px;
+    padding: 4px 12px;
+    background: transparent;
+    border: 1px solid var(--lab);
+    color: var(--dim);
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    cursor: pointer;
+  }
+
+  .earlier:hover {
+    color: var(--hi);
+    border-color: var(--acc);
   }
 
   .empty {

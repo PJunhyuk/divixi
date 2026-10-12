@@ -8,6 +8,7 @@
   import { t } from "./i18n.svelte";
   import { untrack } from "svelte";
   import { FOLLOWING, followed, reached, resized, scrolled, type Stick } from "./scroll";
+  import { createPager } from "./pager.svelte";
 
   /**
    * A worker worker's session, read like a conversation: what the conductor
@@ -17,6 +18,13 @@
   const runs = $derived(store.trackRuns.filter((r) => r.session === store.openWorker));
   const agent = $derived(runs.at(-1)?.agent ?? "");
   const live = $derived(runs.some((r) => r.status === "running" || r.status === "connecting"));
+
+  // Only a page of the turns is drawn to begin with, as in the conversation
+  // (the pager). Each turn's steps are replayed from the store as it comes
+  // into view, not all of them when the worker opens.
+  $effect(() => {
+    for (const run of shownRuns) if (!run.loaded) untrack(() => void store.hydrate(run));
+  });
 
   // Sticking to the foot, the same way the conversation does it: one
   // observer over the content, every decision in scroll.ts. Watching the
@@ -40,7 +48,19 @@
 
   function onScroll() {
     if (scroller) stick = scrolled(stick, scroller);
+    pager.check();
   }
+
+  // Older pages as the human reads back, and the view keeps its place while
+  // one lands (pager.svelte.ts, the same as the conversation's).
+  const pager = createPager({
+    scroller: () => scroller,
+    content: () => content,
+    key: () => `${store.track}/${store.openWorker}`,
+    total: () => runs.length,
+    stuck: () => stick.stuck,
+  });
+  const shownRuns = $derived(runs.slice(pager.first, pager.end));
 
   // The human reaching back is read from their own input, not inferred from
   // the scroll event it causes: a scroll event cannot say who moved the view,
@@ -55,10 +75,12 @@
     if (!box) return;
     const pull = () => {
       stick = reached(stick, box, true);
+      pager.check();
     };
 
     const wheel = (e: WheelEvent) => {
       if (e.deltaY < 0) pull();
+      else pager.check();
     };
     const keys = (e: KeyboardEvent) => {
       if (e.key === "PageUp" || e.key === "ArrowUp" || e.key === "Home") pull();
@@ -71,6 +93,7 @@
     const move = (e: TouchEvent) => {
       const y = e.touches[0]?.clientY ?? touchY;
       if (y > touchY) pull();
+      else pager.check();
       touchY = y;
     };
 
@@ -91,10 +114,9 @@
     const inner = content;
     const box = scroller;
     if (!inner || !box) return;
-    let tall = inner.offsetHeight;
+    pager.settle();
     const observer = new ResizeObserver(() => {
-      const grew = inner.offsetHeight > tall;
-      tall = inner.offsetHeight;
+      const grew = pager.grew();
       const { next, follow: chase } = resized(stick, grew);
       stick = next;
       if (chase) follow();
@@ -161,7 +183,10 @@
       {#if runs.length === 0}
         <div class="mono empty">{t("worker.empty")}</div>
       {/if}
-      {#each runs as run (run.id)}
+      {#if pager.first > 0}
+        <button class="earlier mono" type="button" onclick={() => pager.earlier()}>{t("timeline.earlier", { n: pager.first })}</button>
+      {/if}
+      {#each shownRuns as run (run.id)}
         {#if run.prompt.startsWith(REPORT_REMINDER)}
           <!-- The app, not the conductor, asked again for the report. -->
           <div class="sys mono">{t("report.reminded")}</div>
@@ -213,6 +238,25 @@
     font-size: 10px;
     letter-spacing: 0.12em;
     color: var(--lab);
+  }
+
+  /* Older turns not drawn yet: a line at the top that asks for the next page. */
+  .earlier {
+    display: block;
+    margin: 0 auto 18px;
+    padding: 4px 12px;
+    background: transparent;
+    border: 1px solid var(--lab);
+    color: var(--dim);
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    cursor: pointer;
+  }
+
+  .earlier:hover {
+    color: var(--hi);
+    border-color: var(--acc);
   }
 
   main {
