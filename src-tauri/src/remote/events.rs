@@ -92,7 +92,8 @@ impl Hub {
             return;
         }
         // One number at least is skipped, whatever the clock says, so the
-        // last one given before is never followed on from.
+        // last one given before is never followed on from: a socket left
+        // open across it sees the gap and is told to reload (server.rs).
         ring.0 = (ring.0 + 1).max(now);
         ring.1.clear();
     }
@@ -286,6 +287,27 @@ mod tests {
         let last = hub.last();
         hub.start_at(9000);
         assert_eq!(hub.last(), last, "starting again while on changes nothing");
+    }
+
+    /// A subscriber is sent the numbers after the newest, one after another,
+    /// until the server goes off and on under it: then one is skipped, which
+    /// is how a socket left open knows (server.rs).
+    #[test]
+    fn a_subscriber_sees_a_gap_only_across_off_and_on() {
+        let hub = Hub::default();
+        hub.start_at(1000);
+        hub.push("decision", "{}");
+        let (mut rx, _, newest) = hub.subscribe(0);
+        hub.push("decision", "{}");
+        hub.push("decision", "{}");
+        assert_eq!(rx.try_recv().unwrap().seq, newest + 1);
+        assert_eq!(rx.try_recv().unwrap().seq, newest + 2);
+        hub.stop();
+        hub.push("decision", "{}");
+        // A clock behind the numbers: still a gap.
+        hub.start_at(900);
+        hub.push("decision", "{}");
+        assert!(rx.try_recv().unwrap().seq > newest + 3);
     }
 
     /// A spent pairing link is told to the window showing it, and to no device.

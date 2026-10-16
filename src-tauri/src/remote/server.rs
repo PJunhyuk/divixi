@@ -465,6 +465,14 @@ async fn pump(mut socket: WebSocket, hub: Arc<super::events::Hub>, since: u64) {
         tokio::select! {
             got = rx.recv() => match got {
                 Ok(f) if f.seq > last => {
+                    // Frames come one number after another (Hub::push), and
+                    // the hub skips one when it starts keeping again: the
+                    // server went off and on under this socket, which is
+                    // left open, and what happened meanwhile was not kept.
+                    if f.seq != last + 1 {
+                        let _ = socket.send(Message::Text("{\"reset\":true}".into())).await;
+                        return;
+                    }
                     last = f.seq;
                     if socket.send(Message::Text(f.text.to_string().into())).await.is_err() {
                         return;
