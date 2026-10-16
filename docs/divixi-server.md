@@ -256,6 +256,10 @@ pkill -x divixi-server                                                  # stop
 ```
 
 **Always on (optional): a systemd user service.**
+A server started with `setsid` does not come back after a reboot, and connecting does not start
+it (section 4A): until someone presses **Start it**, no schedule fires, no worker runs, and
+nothing watches anything. On one machine that was 59 hours. The unit below, with
+`enable-linger`, brings it back at boot without anyone signing in.
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -265,6 +269,7 @@ Description=DIVIXI server (remote instance)
 After=network-online.target
 
 [Service]
+# installed by the app (section 0): ExecStart=%h/.divixi/server/current/divixi-server serve
 ExecStart=%h/.local/bin/divixi-server serve
 # where the agent CLIs and node are (with nvm, add that bin directory too)
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin

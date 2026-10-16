@@ -231,6 +231,9 @@ pkill -x divixi-server                                                  # 끄기
 ```
 
 **항상 켜 두기(선택): systemd 사용자 서비스.**
+`setsid`로 띄운 서버는 재부팅 뒤 다시 뜨지 않고, 연결만으로도 켜지지 않습니다(4절 A). 누가 **서버 시작**을
+누를 때까지 예약은 울리지 않고, 작업자는 돌지 않고, 아무것도 지켜보지 않습니다. 한 머신에서는 59시간이
+그렇게 지나갔습니다. 아래 unit과 `enable-linger`면 아무도 로그인하지 않아도 부팅 때 다시 켜집니다.
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -240,6 +243,7 @@ Description=DIVIXI server (remote instance)
 After=network-online.target
 
 [Service]
+# 앱이 설치했다면(0절): ExecStart=%h/.divixi/server/current/divixi-server serve
 ExecStart=%h/.local/bin/divixi-server serve
 # 에이전트 CLI와 node가 있는 곳 (nvm이면 그 bin도 넣으세요)
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
