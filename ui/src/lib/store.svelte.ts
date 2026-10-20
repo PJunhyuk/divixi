@@ -10,6 +10,7 @@ import { libraryPick } from "./libraries";
 import { download, tooLarge } from "./designFile";
 import { notifyDecision, notifyRoutine, resolveDecisions, keepOnlyOpen, ensureDecisionNotice, keepServerNotices, notifyServer, resolveServerNotice } from "./notify.svelte";
 import { AUTO_KEY, autoFrom, autoTo } from "./updateSchedule";
+import { DEFAULT_WATCH_FILTER, parseWatchFilter, WATCH_FILTER_KEY, WEB_WATCH_FILTER_KEY, type WatchFilter } from "./watchFilter";
 import {
   dropQueued,
   liveQueued,
@@ -345,6 +346,20 @@ export type Watched = {
   next_at?: number | null;
   last_line?: string;
   note?: string;
+  /** A schedule's: `at`, `every`, `daily`, `weekly`, `file` or `process`, its spec as the record keeps it, and its message. */
+  kind?: string;
+  spec?: Record<string, unknown> | null;
+  message?: string;
+  last_at?: number | null;
+  /** A job's: who registered it (empty for the conductor), what it watches, and when it was registered, last moved and ended. */
+  worker?: string;
+  what?: string;
+  pid?: number | null;
+  log?: string;
+  done_pattern?: string;
+  registered_at?: number;
+  changed_at?: number;
+  ended_at?: number | null;
 };
 
 /** Context accounting from the agent's `usage` updates. */
@@ -1972,20 +1987,27 @@ class Store {
   }
 
   /**
-   * The current track's schedules and watched jobs, as the core describes
-   * them: what will wake the conductor, shown beside what waits for it.
-   * Read from the core on the track opening and on the `schedules` and
-   * `jobs` events; the list is the record's, never counted from events.
+   * Every track's schedules and watched jobs that have been read, as the
+   * core describes them: what will wake the conductor, for the schedules
+   * popover (SchedulePopover.svelte). Read from the core on a track
+   * opening, on the popover opening and on the `schedules` and `jobs`
+   * events; the list is the record's, never counted from events.
    */
   schedules = $state<Watched[]>([]);
   jobs = $state<Watched[]>([]);
+  /**
+   * What the schedules popover shows and in which order. Kept like the
+   * track list's filter: this PC's window in its setting, a browser (a
+   * phone, another PC's page) in its own storage.
+   */
+  watchFilter = $state<WatchFilter>({ ...DEFAULT_WATCH_FILTER });
 
-  get chatSchedules(): Watched[] {
-    return this.chatArtifact ? [] : this.schedules.filter((s) => s.track === this.track && s.status === "active");
-  }
-
-  get chatJobs(): Watched[] {
-    return this.chatArtifact ? [] : this.jobs.filter((j) => j.track === this.track && (j.status === "running" || j.status === "stalled"));
+  setWatchFilter(patch: Partial<WatchFilter>) {
+    this.watchFilter = { ...this.watchFilter, ...patch };
+    const value = JSON.stringify(this.watchFilter);
+    if (overWeb) return writeLocal(WEB_WATCH_FILTER_KEY, value);
+    if (!this.keeps(WATCH_FILTER_KEY)) return;
+    invoke("set_setting", { key: WATCH_FILTER_KEY, value }).catch((err) => (this.lastError = String(err)));
   }
 
   async loadWatched(track = this.track) {
@@ -1999,19 +2021,36 @@ class Store {
     }
   }
 
+  /**
+   * Every track's schedules and jobs, for the popover's other tracks. Read
+   * when it opens; the `schedules` and `jobs` events keep each track's after.
+   */
+  async loadAllWatched() {
+    const others = this.tracks.map((x) => x.id).filter((id) => id !== this.track);
+    const read = async (cmd: string) => {
+      const lists = await Promise.all(others.map((track) => invoke<Watched[]>(cmd, { track }).catch((err) => (tracing(err), null))));
+      return { tracks: others.filter((_, i) => lists[i]), items: lists.flatMap((l) => l ?? []) };
+    };
+    const [schedules, jobs] = await Promise.all([read("list_schedules"), read("list_jobs")]);
+    this.schedules = [...this.schedules.filter((s) => !schedules.tracks.includes(s.track)), ...schedules.items];
+    this.jobs = [...this.jobs.filter((j) => !jobs.tracks.includes(j.track)), ...jobs.items];
+  }
+
   async cancelSchedule(id: number) {
+    const track = this.schedules.find((s) => s.id === id)?.track ?? this.track;
     try {
       await invoke("schedule_cancel", { id });
-      await this.loadWatched();
+      await this.loadWatched(track);
     } catch (err) {
       this.lastError = String(err);
     }
   }
 
   async unwatchJob(id: number) {
+    const track = this.jobs.find((j) => j.id === id)?.track ?? this.track;
     try {
       await invoke("job_unwatch", { id });
-      await this.loadWatched();
+      await this.loadWatched(track);
     } catch (err) {
       this.lastError = String(err);
     }
@@ -3438,6 +3477,7 @@ class Store {
         setting("tags"),
         ...AGENT_IDS.map((id) => setting(`commands:${id}`)),
       ]);
+      this.watchFilter = parseWatchFilter(overWeb ? readLocal(WEB_WATCH_FILTER_KEY) : await setting(WATCH_FILTER_KEY).catch(() => null));
       try {
         const saved = await setting("tracks_filter");
         if (saved) this.trackFilter = { ...DEFAULT_TRACK_FILTER, ...(JSON.parse(saved) as Partial<TrackFilter>) };
@@ -3567,6 +3607,8 @@ class Store {
         if (this.panelOpen) void this.refreshWorkspace();
         void this.refreshConductor();
         void this.refreshWorkerSessions();
+        // As `selectTrack` does: the track reopened on has schedules too.
+        void this.loadWatched(current.id);
       } else {
         this.view = "new-track";
       }

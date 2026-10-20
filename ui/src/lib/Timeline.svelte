@@ -443,29 +443,6 @@
            message is easy to miss. Polite, and only additions — nothing has
            failed here, and a report going in is not worth interrupting for.
            Same shape as the error stack (ErrorToasts.svelte). -->
-      <!-- What will wake the conductor on its own: the track's schedules
-           and the background jobs being watched. The record's, read back
-           on each change; a line each, with the way to take one back. -->
-      {#if store.chatSchedules.length || store.chatJobs.length}
-        <div class="watched">
-          {#each store.chatSchedules as s (`s${s.id}`)}
-            <div class="sys mono pline">
-              <span class="dot" aria-hidden="true"></span>
-              <span title={t("timeline.scheduleNote")}>{t("timeline.schedule")} · {s.line}</span>
-              <span class="grow"></span>
-              <button class="psend mono" type="button" onclick={() => store.cancelSchedule(s.id)} title={t("timeline.cancelSchedule")}>{t("timeline.cancelSchedule")}</button>
-            </div>
-          {/each}
-          {#each store.chatJobs as j (`j${j.id}`)}
-            <div class="sys mono pline">
-              <span class="dot" class:pulse={j.status === "running"} aria-hidden="true"></span>
-              <span title={t("timeline.jobNote")}>{t("timeline.job")} · {j.line}</span>
-              <span class="grow"></span>
-              <button class="psend mono" type="button" onclick={() => store.unwatchJob(j.id)} title={t("timeline.unwatchJob")}>{t("timeline.unwatchJob")}</button>
-            </div>
-          {/each}
-        </div>
-      {/if}
       <div class="parked" class:empty={waiting.length === 0} role="status" aria-live="polite" aria-atomic="false" aria-relevant="additions">
         <!-- Keyed on the core's id. `what` is a human sentence and not
            unique by construction, and Svelte throws on a duplicate key
@@ -614,13 +591,6 @@
     display: none;
   }
 
-  .watched {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    margin: 6px 0 0;
-  }
-
   .pline {
     display: flex;
     align-items: center;
@@ -636,6 +606,8 @@
   }
 
   .psend {
+    flex-shrink: 0;
+    white-space: nowrap;
     padding: 2px 8px;
     background: transparent;
     border: 1px solid var(--lineq);
